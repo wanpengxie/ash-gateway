@@ -19,6 +19,8 @@ export const LIMITS = {
   maxBodyBytes: 16 * 1024,
   /** One WebSocket frame (envelope or control). */
   maxFrameBytes: 64 * 1024,
+  /** One tunnel frame from the phone (Cloudflare's WebSocket message cap is 1 MiB). */
+  maxTunnelFrameBytes: 1024 * 1024 - 1024,
   challengeTtlMs: 60_000,
   sessionTtlMs: 15 * 60_000,
   pairTicketMaxTtlMs: 5 * 60_000,
@@ -28,6 +30,14 @@ export const LIMITS = {
   maxLiveChallenges: 256,
   maxDeviceNameLength: 64,
   maxClients: 32,
+  /** Browser sessions (devices holding `web_ui`) last a working day; everything else stays short. */
+  browserSessionTtlMs: 12 * 60 * 60_000,
+  /** Request body accepted for tunneled web requests (uploads go through here). */
+  webMaxBodyBytes: 8 * 1024 * 1024,
+  /** Raw bytes per tunnel data frame (base64 keeps each frame well under the 1 MiB WebSocket cap). */
+  tunnelChunkBytes: 256 * 1024,
+  /** How long the gateway waits for the phone to start answering a tunneled request. */
+  tunnelHeadTimeoutMs: 30_000,
 } as const;
 
 export const PERMISSIONS = [
@@ -36,6 +46,8 @@ export const PERMISSIONS = [
   "cancel_own_task",
   "request_sensitive_action",
   "expose_capability",
+  /** Full DSH web UI through the gateway tunnel — only for the owner's own devices. */
+  "web_ui",
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -114,6 +126,21 @@ export async function envelopeSigningInput(e: Omit<Envelope, "sig">): Promise<By
 
 /** Frames the gateway itself sends or accepts on a WebSocket (never relayed). */
 export type ControlFrame = { t: "gw"; op: string; [k: string]: unknown };
+
+/**
+ * Tunnel frames between the gateway and the phone (`t: "tun"`). The gateway opens a
+ * stream id (`sid`) per browser HTTP request or WebSocket and the phone answers on it:
+ *
+ *   gateway → phone  http.req {sid, method, path, headers, from}  then  http.reqbody {sid, data}*  http.reqend {sid}
+ *   phone → gateway  http.head {sid, status, headers}  http.body {sid, data}*  http.end {sid} | http.error {sid, message}
+ *   gateway → phone  ws.open {sid, path, protocols, from}
+ *   phone → gateway  ws.opened {sid, protocol} | ws.error {sid, message}
+ *   both ways        ws.msg {sid, text | b64, more?}  ws.close {sid, code, reason}
+ *
+ * Bodies and binary messages travel as base64 chunks of at most LIMITS.tunnelChunkBytes;
+ * a ws.msg with `more: true` is continued by the next ws.msg on the same sid.
+ */
+export type TunnelFrame = { t: "tun"; op: string; sid: string; [k: string]: unknown };
 
 export class ProtocolError extends Error {
   constructor(

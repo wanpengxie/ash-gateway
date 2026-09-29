@@ -187,3 +187,42 @@ Suggested envelope types:
 - `agent.message` — client → phone; payload `{text}`.
 - `agent.event` — phone → client; streamed output and status.
 - `task.status`, `task.cancel`.
+
+## Web tunnel (`web_ui`)
+
+Every path **outside `/v1/`** is the phone's DSH web UI.
+
+- A browser whose `ash_session` cookie belongs to a device holding `web_ui` is
+  tunneled to the phone.
+- Browser sessions for such devices last 12 h; all other sessions last 15 min.
+- An unauthenticated browser gets the pairing/login page (also at `/v1/web`): 401 when
+  it has no session, 403 when the device lacks `web_ui`, and 503 while the phone is
+  offline.
+
+The gateway opens one stream id (`sid`) per HTTP request or WebSocket and exchanges
+`t: "tun"` frames with the owner's socket:
+
+| direction | op | fields |
+|---|---|---|
+| gateway → phone | `http.req` | sid, method, path (with query), headers `[[k,v]…]`, from |
+| gateway → phone | `http.reqbody` / `http.reqend` | sid, data (base64url) |
+| phone → gateway | `http.head` | sid, status, headers |
+| phone → gateway | `http.body` / `http.end` / `http.error` | sid, data / — / message |
+| gateway → phone | `ws.open` | sid, path, from |
+| phone → gateway | `ws.opened` / `ws.error` | sid |
+| both | `ws.msg` | sid, `text` or `b64`, `more: true` if the next frame continues it |
+| both | `ws.close` | sid, code, reason |
+
+Rules:
+- **Chunk size**: data chunks are at most 256 KiB raw. The phone's frames may be up
+  to 1 MiB; everyone else is held to the 64 KiB relay limit.
+- **Headers the gateway never forwards to the phone**: the gateway's own cookie and
+  credentials, hop-by-hop headers, `cf-*` and `x-forwarded-*`.
+- **Headers the phone never returns**: `set-cookie`, content-length and encoding.
+- **Replay on the phone**: the phone replays each stream against its local engine as a
+  loopback request — Host and Origin are rewritten to the engine's origin, and the
+  engine's own session cookie is attached. The engine therefore never sees a
+  non-loopback request.
+
+`ash-link` ([`link/ash-link.ts`](../link/ash-link.ts)) is the reference phone-side
+implementation.

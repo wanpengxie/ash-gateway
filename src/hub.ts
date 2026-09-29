@@ -13,9 +13,11 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { json } from "./http";
 import {
+  b64u,
   ctx as signCtx,
   deviceIdForKey,
   type Envelope,
+  fromB64u,
   hmacSha256,
   importPublicKey,
   LIMITS,
@@ -29,15 +31,38 @@ import {
   timingSafeEqual,
   verifySignature,
 } from "./protocol";
+import { webLoginPage } from "./webui";
 
-export const GATEWAY_VERSION = "0.1.0";
+export const GATEWAY_VERSION = "0.2.0";
 
 interface Attachment {
+  kind?: "device";
   id: string;
   role: Role;
   /** Origin the device connected through; owner signatures made on this socket are bound to it. */
   origin: string;
 }
+
+/** A browser WebSocket that the gateway tunnels to the phone (e.g. DSH's /api/remote.mux). */
+interface TunnelAttachment {
+  kind: "tun";
+  sid: string;
+  device: string;
+}
+
+/** One tunneled browser HTTP request waiting for / streaming the phone's answer (memory only). */
+interface PendingHttp {
+  resolve: (r: Response) => void;
+  writer: WritableStreamDefaultWriter<Uint8Array>;
+  readable: ReadableStream<Uint8Array>;
+  headSent: boolean;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/** Request headers never forwarded to the phone: gateway credentials, hop-by-hop, edge metadata. */
+const DROP_REQUEST_HEADERS = /^(cookie|authorization|host|connection|upgrade|content-length|transfer-encoding|keep-alive|te|trailer|sec-websocket-.*|cf-.*|x-forwarded-.*|x-real-ip|x-ash-.*|true-client-ip|cdn-loop)$/i;
+/** Response headers never returned to the browser: the phone-side session and framing. */
+const DROP_RESPONSE_HEADERS = /^(set-cookie|connection|content-length|transfer-encoding|content-encoding|keep-alive)$/i;
 
 interface DeviceRow {
   id: string;
@@ -64,6 +89,9 @@ interface PairRequestRow {
 
 export class GatewayHub extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  private readonly pendingHttp = new Map<string, PendingHttp>();
+  /** Partial ws.msg payloads (phone → browser) waiting for their last fragment. */
+  private readonly wsParts = new Map<string, string[]>();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -164,8 +192,11 @@ export class GatewayHub extends DurableObject<Env> {
     const url = new URL(request.url);
     const origin = request.headers.get("x-ash-origin") ?? url.origin;
     try {
+      if (!url.pathname.startsWith("/v1/")) return await this.web(request, url);
       const route = `${request.method} ${url.pathname}`;
       switch (route) {
+        case "GET /v1/web":
+          return webLoginPage();
         case "GET /v1/health":
           return this.health();
         case "GET /v1/ws":
@@ -271,11 +302,12 @@ export class GatewayHub extends DurableObject<Env> {
     if (!sigOk) throw new ProtocolError("bad_signature", "signature does not verify", 401);
     const now = this.device(deviceId);
     if (!now || now.revoked) throw new ProtocolError("unknown_device", "device is not registered", 404);
-    const expires_at = Date.now() + LIMITS.sessionTtlMs;
+    const ttl = hasPermission(now, "web_ui") ? LIMITS.browserSessionTtlMs : LIMITS.sessionTtlMs;
+    const expires_at = Date.now() + ttl;
     this.sql.exec("INSERT INTO sessions (token_hash, device_id, expires_at) VALUES (?, ?, ?)", tokenHash, deviceId, expires_at);
-    // Browsers get an HttpOnly cookie (used by the same-origin WebSocket upgrade);
+    // Browsers get an HttpOnly cookie (used for the tunneled web UI and same-origin WebSockets);
     // native clients use the returned token as a Bearer credential.
-    const cookie = `ash_session=${token}; Path=/v1/; Max-Age=${Math.floor(LIMITS.sessionTtlMs / 1000)}; Secure; HttpOnly; SameSite=Strict`;
+    const cookie = `ash_session=${token}; Path=/; Max-Age=${Math.floor(ttl / 1000)}; Secure; HttpOnly; SameSite=Strict`;
     return json(200, { token, expires_at, device_id: deviceId, role: dev.role }, { "set-cookie": cookie });
   }
 
@@ -370,10 +402,14 @@ export class GatewayHub extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const me = ws.deserializeAttachment() as Attachment | null;
+    const att = ws.deserializeAttachment() as Attachment | TunnelAttachment | null;
+    if (att?.kind === "tun") return this.tunnelFromBrowser(att, message);
+    const me = att as Attachment | null;
     if (!me) return ws.close(4001, "no identity");
     if (typeof message !== "string") return this.reply(ws, { t: "gw", op: "error", code: "binary_not_supported" });
-    if (message.length > LIMITS.maxFrameBytes) return this.reply(ws, { t: "gw", op: "error", code: "frame_too_large" });
+    // Tunnel data from the phone rides in ~350 KB frames; everyone else stays at the relay limit.
+    const limit = me.role === "owner" ? LIMITS.maxTunnelFrameBytes : LIMITS.maxFrameBytes;
+    if (message.length > limit) return this.reply(ws, { t: "gw", op: "error", code: "frame_too_large" });
     let frame: Record<string, unknown>;
     try {
       frame = JSON.parse(message);
@@ -386,7 +422,10 @@ export class GatewayHub extends DurableObject<Env> {
     if (!dev || dev.revoked) return ws.close(4003, "revoked");
     try {
       if (frame.t === "gw") await this.control(ws, me, dev, frame);
-      else this.relay(ws, me, frame, message);
+      else if (frame.t === "tun") {
+        if (me.role !== "owner") throw new ProtocolError("forbidden", "only the agent phone answers tunnels");
+        this.tunnelFromOwner(frame);
+      } else this.relay(ws, me, frame, message);
     } catch (e) {
       const code = e instanceof ProtocolError ? e.code : "internal";
       if (!(e instanceof ProtocolError)) console.error("ws error", e);
@@ -395,14 +434,23 @@ export class GatewayHub extends DurableObject<Env> {
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    const me = ws.deserializeAttachment() as Attachment | null;
+    const att = ws.deserializeAttachment() as Attachment | TunnelAttachment | null;
     try {
       ws.close(code, reason);
     } catch {
       // already closed
     }
+    if (att?.kind === "tun") {
+      this.wsParts.delete(att.sid);
+      this.sendToOwner({ t: "tun", op: "ws.close", sid: att.sid, code: safeCloseCode(code), reason: String(reason).slice(0, 120) });
+      return;
+    }
+    const me = att as Attachment | null;
     if (me?.role === "owner" && this.ctx.getWebSockets(`dev:${me.id}`).filter((w) => w !== ws).length === 0) {
       this.broadcastPresence(false);
+      // The phone is gone: every tunnel through it is gone too.
+      for (const t of this.ctx.getWebSockets("tun")) t.close(4503, "agent phone disconnected");
+      for (const [sid, p] of this.pendingHttp) this.failHttp(sid, p, 502, "agent phone disconnected");
     }
   }
 
@@ -559,6 +607,178 @@ export class GatewayHub extends DurableObject<Env> {
     throw new ProtocolError("unknown_op", `unknown control op ${String(op)}`);
   }
 
+  // ------------------------------------------------------------------ web tunnel
+
+  /**
+   * Everything outside /v1/ is the phone's DSH web UI, reached through the tunnel.
+   * Only a paired device holding `web_ui` gets in; anyone else sees the pairing page.
+   */
+  private async web(request: Request, url: URL): Promise<Response> {
+    const token = sessionToken(request).token;
+    const dev = token ? await this.sessionDevice(token) : null;
+    if (!dev) {
+      const wantsPage = request.method === "GET" && (request.headers.get("accept") ?? "").includes("text/html");
+      return wantsPage ? webLoginPage(401) : json(401, { error: "unauthorized" });
+    }
+    if (!hasPermission(dev, "web_ui")) return webLoginPage(403);
+    const owner = this.owner();
+    const phone = owner ? this.ctx.getWebSockets(`dev:${owner.id}`)[0] : undefined;
+    if (!owner || !phone) return webLoginPage(503);
+
+    const path = url.pathname + url.search;
+    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const sid = randomToken(12);
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+      this.ctx.acceptWebSocket(server, ["tun", `tun:${sid}`]);
+      server.serializeAttachment({ kind: "tun", sid, device: dev.id } satisfies TunnelAttachment);
+      phone.send(JSON.stringify({ t: "tun", op: "ws.open", sid, path, from: dev.id }));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    const body = request.method === "GET" || request.method === "HEAD" ? null : new Uint8Array(await request.arrayBuffer());
+    if (body && body.length > LIMITS.webMaxBodyBytes) return json(413, { error: "body_too_large" });
+    const headers: [string, string][] = [];
+    request.headers.forEach((v, k) => {
+      if (!DROP_REQUEST_HEADERS.test(k)) headers.push([k, v]);
+    });
+    const sid = randomToken(12);
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const answer = new Promise<Response>((resolve) => {
+      const timer = setTimeout(() => {
+        const p = this.pendingHttp.get(sid);
+        if (p && !p.headSent) this.failHttp(sid, p, 504, "the agent phone did not answer in time");
+      }, LIMITS.tunnelHeadTimeoutMs);
+      this.pendingHttp.set(sid, { resolve, writer: writable.getWriter(), readable, headSent: false, timer });
+    });
+    phone.send(JSON.stringify({ t: "tun", op: "http.req", sid, method: request.method, path, headers, from: dev.id }));
+    if (body) {
+      for (let i = 0; i < body.length; i += LIMITS.tunnelChunkBytes) {
+        phone.send(JSON.stringify({ t: "tun", op: "http.reqbody", sid, data: b64u(body.slice(i, i + LIMITS.tunnelChunkBytes)) }));
+      }
+    }
+    phone.send(JSON.stringify({ t: "tun", op: "http.reqend", sid }));
+    return answer;
+  }
+
+  /** Frames the phone sends back on a tunnel stream. */
+  private tunnelFromOwner(f: Record<string, unknown>): void {
+    const sid = typeof f.sid === "string" ? f.sid : "";
+    switch (f.op) {
+      case "http.head": {
+        const p = this.pendingHttp.get(sid);
+        if (!p || p.headSent) return;
+        p.headSent = true;
+        clearTimeout(p.timer);
+        const status = typeof f.status === "number" && f.status >= 200 && f.status <= 599 ? f.status : 502;
+        const headers = new Headers();
+        for (const [k, v] of Array.isArray(f.headers) ? (f.headers as [string, string][]) : []) {
+          if (typeof k === "string" && typeof v === "string" && !DROP_RESPONSE_HEADERS.test(k)) headers.append(k, v);
+        }
+        headers.set("x-ash-tunnel", "1");
+        const noBody = status === 204 || status === 205 || status === 304;
+        if (noBody) {
+          p.writer.close().catch(() => {});
+          this.pendingHttp.delete(sid);
+        }
+        p.resolve(new Response(noBody ? null : p.readable, { status, headers }));
+        return;
+      }
+      case "http.body": {
+        const p = this.pendingHttp.get(sid);
+        if (p && typeof f.data === "string") p.writer.write(fromB64u(f.data)).catch(() => {});
+        return;
+      }
+      case "http.end": {
+        const p = this.pendingHttp.get(sid);
+        if (!p) return;
+        this.pendingHttp.delete(sid);
+        clearTimeout(p.timer);
+        p.writer.close().catch(() => {});
+        return;
+      }
+      case "http.error": {
+        const p = this.pendingHttp.get(sid);
+        if (p) this.failHttp(sid, p, 502, String(f.message ?? "tunnel error"));
+        return;
+      }
+      case "ws.opened":
+        return;
+      case "ws.error":
+      case "ws.close": {
+        this.wsParts.delete(sid);
+        const code = f.op === "ws.error" ? 4502 : safeCloseCode(Number(f.code));
+        for (const s of this.ctx.getWebSockets(`tun:${sid}`)) s.close(code, String(f.reason ?? f.message ?? "").slice(0, 120));
+        return;
+      }
+      case "ws.msg": {
+        const target = this.ctx.getWebSockets(`tun:${sid}`)[0];
+        if (!target) return this.sendToOwner({ t: "tun", op: "ws.close", sid, code: 1000, reason: "browser gone" });
+        const part = typeof f.text === "string" ? f.text : typeof f.b64 === "string" ? f.b64 : null;
+        if (part === null) return;
+        const parts = this.wsParts.get(sid) ?? [];
+        parts.push(part);
+        if (f.more === true) {
+          this.wsParts.set(sid, parts);
+          return;
+        }
+        this.wsParts.delete(sid);
+        const whole = parts.join("");
+        if (typeof f.b64 === "string") target.send(fromB64u(whole));
+        else target.send(whole);
+        return;
+      }
+    }
+  }
+
+  /** A browser tunnel socket spoke: pass it to the phone, fragmenting large messages. */
+  private tunnelFromBrowser(att: TunnelAttachment, message: string | ArrayBuffer): void {
+    const binary = typeof message !== "string";
+    const payload = binary ? b64u(new Uint8Array(message as ArrayBuffer)) : (message as string);
+    const size = LIMITS.tunnelChunkBytes;
+    for (let i = 0; i < payload.length || i === 0; i += size) {
+      const chunk = payload.slice(i, i + size);
+      this.sendToOwner({ t: "tun", op: "ws.msg", sid: att.sid, [binary ? "b64" : "text"]: chunk, more: i + size < payload.length });
+      if (payload.length === 0) break;
+    }
+  }
+
+  private failHttp(sid: string, p: PendingHttp, status: number, message: string): void {
+    this.pendingHttp.delete(sid);
+    clearTimeout(p.timer);
+    if (!p.headSent) {
+      p.headSent = true;
+      p.writer.close().catch(() => {});
+      p.resolve(json(status, { error: "tunnel", message }));
+    } else {
+      p.writer.abort(new Error(message)).catch(() => {});
+    }
+  }
+
+  private sendToOwner(frame: Record<string, unknown>): void {
+    const owner = this.owner();
+    if (!owner) return;
+    const text = JSON.stringify(frame);
+    for (const ws of this.ctx.getWebSockets(`dev:${owner.id}`)) {
+      try {
+        ws.send(text);
+      } catch {
+        // closing
+      }
+    }
+  }
+
+  /** Device behind a session token, or null if the session or the device is no longer valid. */
+  private async sessionDevice(token: string): Promise<DeviceRow | null> {
+    const tokenHash = await sha256b64u(token);
+    const s = this.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM sessions WHERE token_hash = ? AND expires_at > ?", tokenHash, Date.now())
+      .toArray()[0];
+    if (!s) return null;
+    const dev = this.device(s.device_id);
+    return dev && !dev.revoked ? dev : null;
+  }
+
   private pendingRequest(requestId: string): PairRequestRow {
     const r = this.sql.exec<PairRequestRow>("SELECT * FROM pair_requests WHERE id = ? AND expires_at > ?", requestId, Date.now()).toArray()[0];
     if (!r) throw new ProtocolError("unknown_request", "unknown or expired pairing request");
@@ -643,6 +863,19 @@ function perms(o: Record<string, unknown>): string[] {
     if (!(PERMISSIONS as readonly string[]).includes(p)) throw new ProtocolError("bad_permission", `unknown permission ${String(p)}`);
   }
   return [...new Set(v as string[])];
+}
+
+function hasPermission(dev: DeviceRow, perm: string): boolean {
+  try {
+    return (JSON.parse(dev.permissions) as string[]).includes(perm);
+  } catch {
+    return false;
+  }
+}
+
+/** Close codes a Worker may send: 1000, or the 3000–4999 application range. */
+function safeCloseCode(code: number): number {
+  return code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000;
 }
 
 /** Session token from (in order) Bearer header, ash.bearer.<token> subprotocol, or the browser cookie. */

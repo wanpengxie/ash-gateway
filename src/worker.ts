@@ -15,8 +15,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/" && request.method === "GET") return landing(url.origin);
-    if (!url.pathname.startsWith("/v1/")) return json(404, { error: "not_found" });
+    // /v1/* is the gateway API; every other path is the phone's DSH web UI through the
+    // tunnel (the hub answers with the pairing page until this browser is a paired device).
+    const api = url.pathname.startsWith("/v1/");
 
     // Browsers always send Origin on cross-site POST and WebSocket requests; native
     // clients send none. A foreign Origin is refused before anything reaches the hub.
@@ -25,7 +26,7 @@ export default {
     if (origin !== null && origin !== url.origin) return json(403, { error: "origin_not_allowed" });
 
     const length = Number(request.headers.get("content-length") ?? "0");
-    if (length > LIMITS.maxBodyBytes) return json(413, { error: "body_too_large" });
+    if (length > (api ? LIMITS.maxBodyBytes : LIMITS.webMaxBodyBytes)) return json(413, { error: "body_too_large" });
 
     const headers = new Headers(request.headers);
     for (const h of INTERNAL_HEADERS) headers.delete(h);
@@ -37,14 +38,3 @@ export default {
     return hub.fetch(new Request(request, { headers }));
   },
 } satisfies ExportedHandler<Env>;
-
-function landing(origin: string): Response {
-  const body = `<!doctype html><meta charset="utf-8"><title>ash gateway</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}</style>
-<h1>ash gateway</h1>
-<p>This is a self-hosted relay for an <a href="https://github.com/wanpengxie/ash-gateway">ash</a> personal agent phone.
-It stores no conversations, memory or files.</p>
-<p>Gateway URL for the app: <code>${origin}</code></p>
-<p>Status: <a href="/v1/health">/v1/health</a></p>`;
-  return new Response(body, { headers: { "content-type": "text/html; charset=utf-8" } });
-}

@@ -219,6 +219,8 @@ export class Connection {
   private readonly frames: Record<string, unknown>[] = [];
   private readonly waiters: { pred: (f: Record<string, unknown>) => boolean; resolve: (f: Record<string, unknown>) => void }[] = [];
   private seq = 0;
+  /** Long-lived connections: frames no waiter wants go here instead of piling up in the buffer. */
+  onUnmatched: ((frame: Record<string, unknown>) => void) | null = null;
 
   constructor(readonly ws: WebSocket) {
     this.opened = new Promise((resolve, reject) => {
@@ -239,6 +241,7 @@ export class Connection {
       }
       const i = this.waiters.findIndex((w) => w.pred(frame));
       if (i >= 0) this.waiters.splice(i, 1)[0].resolve(frame);
+      else if (this.onUnmatched) this.onUnmatched(frame);
       else this.frames.push(frame);
     });
   }
