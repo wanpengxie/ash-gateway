@@ -10,7 +10,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "e2e": "tsx scripts/e2e.ts"
+    "e2e": "tsx scripts/e2e.ts",
+    "hibernation": "tsx scripts/hibernation.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260929.1",
