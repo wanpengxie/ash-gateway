@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ash-gateway",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "GatewayHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GatewayHub"] }],
+  "vars": {
+    // Change this value (from your own Cloudflare account) to wipe the gateway,
+    // e.g. after losing the Agent phone. A public request can never do this.
+    "RESET_EPOCH": "0"
+  },
+  "observability": { "enabled": true }
+}
