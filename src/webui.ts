@@ -2,7 +2,7 @@
 //
 // The browser keeps a non-extractable P-256 key in IndexedDB. Pairing uses the one-time
 // code shown on the phone; the phone approves (and grants `web_ui`); afterwards every
-// visit signs a challenge to get a session cookie, and the phone's DSH UI loads through
+// visit signs a challenge to get a session cookie, and the phone's ash UI loads through
 // the tunnel at "/".
 
 export function webLoginPage(status = 200): Response {
@@ -21,6 +21,7 @@ export function webLoginPage(status = 200): Response {
 
 const PAGE = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>Ash</title>
 <style>
 body{font:15px/1.6 system-ui,-apple-system,sans-serif;margin:0;background:#f6f7f9;color:#1d2430}

@@ -190,7 +190,7 @@ Suggested envelope types:
 
 ## Web tunnel (`web_ui`)
 
-Every path **outside `/v1/`** is the phone's DSH web UI.
+Every path **outside `/v1/`** is the phone's ash UI (and the `/api/*` it uses).
 
 - A browser whose `ash_session` cookie belongs to a device holding `web_ui` is
   tunneled to the phone.
@@ -212,6 +212,7 @@ The gateway opens one stream id (`sid`) per HTTP request or WebSocket and exchan
 | phone → gateway | `ws.opened` / `ws.error` | sid |
 | both | `ws.msg` | sid, `text` or `b64`, `more: true` if the next frame continues it |
 | both | `ws.close` | sid, code, reason |
+| gateway → phone | `http.abort` | sid — the browser went away mid-response (e.g. a closed event stream); stop producing |
 
 Rules:
 - **Chunk size**: data chunks are at most 256 KiB raw. The phone's frames may be up
@@ -219,10 +220,22 @@ Rules:
 - **Headers the gateway never forwards to the phone**: the gateway's own cookie and
   credentials, hop-by-hop headers, `cf-*` and `x-forwarded-*`.
 - **Headers the phone never returns**: `set-cookie`, content-length and encoding.
-- **Replay on the phone**: the phone replays each stream against its local engine as a
-  loopback request — Host and Origin are rewritten to the engine's origin, and the
-  engine's own session cookie is attached. The engine therefore never sees a
-  non-loopback request.
+- **Identity**: `from` is the paired device the gateway authenticated. The phone serves
+  the request as that device (ash core: member `device:<id>`), never as itself.
+- **Streams**: responses may stream indefinitely (Server-Sent Events). When writing to the
+  browser fails, the gateway sends `http.abort` so the phone stops; phones may also end
+  long streams themselves (browsers reconnect with `Last-Event-ID`).
 
-`ash-link` ([`link/ash-link.ts`](../link/ash-link.ts)) is the reference phone-side
-implementation.
+### Device presence
+
+The owner receives `{t: "gw", op: "device.presence", device_id, online}` whenever a paired
+client connects or its last socket closes, so it can keep its member list live without polling.
+
+### Phone → device
+
+The owner may open a stream to a paired client holding `expose_capability`: the same
+`http.*` frames with `to: <device id>`; the device answers on the same `sid` (frames arrive
+with `from`). ash core uses `GET /ash/manifest` (capabilities) and `POST /ash/call`
+(`{capability, args, caller}` → `{ok, content, data?, error?}`).
+
+The device side is ash core ([github.com/wanpengxie/ash](https://github.com/wanpengxie/ash)).

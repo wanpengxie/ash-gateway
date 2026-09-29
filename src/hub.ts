@@ -33,7 +33,7 @@ import {
 } from "./protocol";
 import { webLoginPage } from "./webui";
 
-export const GATEWAY_VERSION = "0.3.0";
+export const GATEWAY_VERSION = "0.4.0";
 
 interface Attachment {
   kind?: "device";
@@ -43,7 +43,7 @@ interface Attachment {
   origin: string;
 }
 
-/** A browser WebSocket that the gateway tunnels to the phone (e.g. DSH's /api/remote.mux). */
+/** A browser WebSocket that the gateway tunnels to the phone. */
 interface TunnelAttachment {
   kind: "tun";
   sid: string;
@@ -394,6 +394,8 @@ export class GatewayHub extends DurableObject<Env> {
       }),
     );
     if (dev.role === "owner") this.broadcastPresence(true);
+    // The phone keeps its member list live: tell it when one of its devices comes online.
+    else if (owner) this.sendTo(owner.id, { t: "gw", op: "device.presence", device_id: dev.id, online: true });
     return new Response(null, {
       status: 101,
       webSocket: client,
@@ -459,6 +461,9 @@ export class GatewayHub extends DurableObject<Env> {
       // The phone is gone: every tunnel through it is gone too.
       for (const t of this.ctx.getWebSockets("tun")) t.close(4503, "agent phone disconnected");
       for (const [sid, p] of this.pendingHttp) this.failHttp(sid, p, 502, "agent phone disconnected");
+    }
+    if (me?.role === "client" && this.ctx.getWebSockets(`dev:${me.id}`).filter((w) => w !== ws).length === 0) {
+      this.sendToOwner({ t: "gw", op: "device.presence", device_id: me.id, online: false });
     }
   }
 
@@ -618,7 +623,7 @@ export class GatewayHub extends DurableObject<Env> {
   // ------------------------------------------------------------------ web tunnel
 
   /**
-   * Everything outside /v1/ is the phone's DSH web UI, reached through the tunnel.
+   * Everything outside /v1/ is the phone's ash UI (and its /api), reached through the tunnel.
    * Only a paired device holding `web_ui` gets in; anyone else sees the pairing page.
    */
   private async web(request: Request, url: URL): Promise<Response> {
@@ -666,6 +671,8 @@ export class GatewayHub extends DurableObject<Env> {
       }
     }
     phone.send(JSON.stringify({ t: "tun", op: "http.reqend", sid }));
+    // The browser went away (e.g. closed an event stream): let the phone stop producing.
+    request.signal?.addEventListener("abort", () => this.abortHttp(sid));
     return answer;
   }
 
@@ -714,7 +721,9 @@ export class GatewayHub extends DurableObject<Env> {
       }
       case "http.body": {
         const p = this.pendingHttp.get(sid);
-        if (p && typeof f.data === "string") p.writer.write(fromB64u(f.data)).catch(() => {});
+        // A write fails once the browser has gone (e.g. a closed event stream): tell the phone to stop.
+        if (p && typeof f.data === "string")
+          p.writer.write(fromB64u(f.data)).catch(() => this.abortHttp(sid));
         return;
       }
       case "http.end": {
@@ -769,6 +778,15 @@ export class GatewayHub extends DurableObject<Env> {
       this.sendToOwner({ t: "tun", op: "ws.msg", sid: att.sid, [binary ? "b64" : "text"]: chunk, more: i + size < payload.length });
       if (payload.length === 0) break;
     }
+  }
+
+  private abortHttp(sid: string): void {
+    const p = this.pendingHttp.get(sid);
+    if (!p) return;
+    this.pendingHttp.delete(sid);
+    clearTimeout(p.timer);
+    p.writer.abort(new Error("browser went away")).catch(() => {});
+    this.sendToOwner({ t: "tun", op: "http.abort", sid });
   }
 
   private failHttp(sid: string, p: PendingHttp, status: number, message: string): void {

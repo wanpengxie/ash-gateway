@@ -46,7 +46,7 @@ export const PERMISSIONS = [
   "cancel_own_task",
   "request_sensitive_action",
   "expose_capability",
-  /** Full DSH web UI through the gateway tunnel — only for the owner's own devices. */
+  /** The full ash UI through the gateway tunnel — only for the owner's own devices. */
   "web_ui",
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];

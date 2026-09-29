@@ -39,42 +39,26 @@
 
 ## 网页端
 
-配对时被授予 `web_ui` 权限的浏览器，直接打开网关地址 `https://ash-gateway.<子域>.workers.dev/`，就能用到手机上 DSH 的**完整界面**。它通过网关隧道到达手机，手机再把请求当作本机访问交给引擎。
+配对时被授予 `web_ui` 权限的浏览器，直接打开网关地址 `https://ash-gateway.<子域>.workers.dev/`，就能用到手机上 **ash 的完整界面**（和手机 App 里的是同一个）。请求通过网关隧道到达手机上的 ash core，ash core 知道是哪台已配对设备在说话。
 
 - **第一次打开**：页面是配对页。在手机上生成配对码，粘贴进去，等手机确认。
-- **之后**：浏览器用本地保存的不可导出密钥自动签名登录。
+- **之后**：浏览器用本地保存的不可导出密钥自动签名登录。页面可以「添加到主屏幕」（`/manifest.webmanifest` 与图标公开、可缓存）。
 
-`web_ui` 等于完整权限，只应批准给你自己的设备。
+`web_ui` 等于你本人在用，只应批准给你自己的设备。远程浏览器可以聊天、看记录、确认操作，但配对、授权和密钥设置只能在手机上做。
 
-## ash-link（设备端程序）
+## 设备端
 
-`npm run build:link` 会打包出一个单文件 `dist/ash-link.mjs`，没有任何依赖，Node 22 及以上可以直接运行。ash 手机 App 用它连接网关：
+设备端程序是 [ash](https://github.com/wanpengxie/ash) 仓库里的 **ash core**（它吸收了早期的 ash-link）：
 
-- **首次认领**：读取 `<stateDir>/bootstrap-secret`，认领成功后删除这个文件。
-- **隧道回放**：把隧道里的请求当作本机访问，转给 DSH 引擎。
-- **配对审批**：在本机 `127.0.0.1:3095` 提供一个需要令牌的页面，用来生成配对码、批准或撤销设备。
+- **手机（owner）**：ash App 里的 ash core 负责认领、配对审批（用手机 Keystore 里的密钥签名）、隧道（网页端）和调用笔记本的能力。
+- **笔记本（client）**：同一个 ash core 以 client 角色运行，把本机的 MCP 服务作为「设备能力」借给手机上的 Agent：
 
-### 笔记本当设备（client 角色）
+  ```json
+  { "role": "client", "gateway": "https://ash-gateway.<子域>.workers.dev", "stateDir": "~/.ash/laptop", "name": "MacBook",
+    "mcp": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ash-shared"] } } }
+  ```
 
-笔记本以 client 角色运行 ash-link，就能把本机的 MCP 工具借给手机上的主 Agent。
-
-1. 在笔记本上写一份配置：
-
-   ```json
-   { "role": "client", "gateway": "https://ash-gateway.<子域>.workers.dev", "stateDir": "~/.ash/link", "name": "MacBook",
-     "mcp": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ash-shared"] } } }
-   ```
-
-   - stdio 类型的 MCP 服务由 ash-link 内置的桥转成 HTTP。
-   - `{"url": "http://127.0.0.1:8931/mcp"}` 这种 HTTP 服务直接转发。
-2. 在手机上生成配对码，然后在笔记本上执行：`node ash-link.mjs --config laptop.json --pair <配对码>`。
-3. 在手机上批准，并勾选「开放本机工具给 Agent」，也就是授予 `expose_capability` 权限。
-4. 在手机 DSH 的配置里加一个 `dsh-mcp-client` 条目：
-   - `transport: streamable-http`
-   - `url: http://127.0.0.1:3096/d/<笔记本设备 ID>/files`
-   - 请求头 `x-ash-link`，值为手机 ash-link 的 `mcp-token`
-
-   之后主 Agent 的工具列表里会出现 `mcp__<名字>__*`。
+  在手机上生成配对码，然后在笔记本上执行 `node ash-core.mjs --config laptop.json --pair <配对码>`，在手机上批准并勾选「开放本机能力给 Agent」（`expose_capability`）。之后手机上的 Agent 直接多出 `macbook__files_*` 这样的工具，**不用改任何 DSH 配置**。
 
 笔记本能开放什么，完全由它自己的配置决定。没有 `expose_capability` 权限的设备收不到任何隧道流量。
 
@@ -100,7 +84,7 @@ npm run dev                     # wrangler dev，本地 http://127.0.0.1:8787
 GATEWAY_URL=http://127.0.0.1:8787 BOOTSTRAP_SECRET=... npm run e2e
 ```
 
-`npm run e2e` 会同时扮演手机和电脑，覆盖认领、重放、配对、签名转发、伪造发送方、离线和撤销，共 33 项检查；`npm run tunnel-e2e` 用一个模拟的 DSH 引擎和真实运行的 ash-link 测网页隧道，共 24 项检查（含笔记本 MCP）。它会用一把临时密钥认领网关，所以**不要对你真正要给手机用的网关跑**；要跑就用单独部署的测试实例，或者跑完后用 `RESET_EPOCH` 重置。
+`npm run e2e` 会同时扮演手机和电脑，覆盖认领、重放、配对、签名转发、伪造发送方、离线和撤销；`npm run tunnel-e2e` 用手机和笔记本的测试替身测隧道：网页端（大文件、POST、事件流与中途断开、WebSocket）、设备上下线通知、手机调用笔记本的能力。它会用一把临时密钥认领网关，所以**不要对你真正要给手机用的网关跑**；要跑就用单独部署的测试实例，或者跑完后用 `RESET_EPOCH` 重置。
 
 ## 免费额度
 

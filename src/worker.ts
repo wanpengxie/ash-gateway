@@ -5,6 +5,7 @@ import type { Env } from "./env";
 import { json } from "./http";
 import { GatewayHub } from "./hub";
 import { LIMITS } from "./protocol";
+import { ICON_SVG, WEB_MANIFEST } from "./static";
 
 export { GatewayHub };
 
@@ -15,8 +16,13 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // /v1/* is the gateway API; every other path is the phone's DSH web UI through the
-    // tunnel (the hub answers with the pairing page until this browser is a paired device).
+    // The web app manifest and its icon are public and cached at the edge: browsers fetch them
+    // without cookies (install prompts, the pairing page), and they carry nothing private.
+    if (request.method === "GET" && url.pathname === "/manifest.webmanifest") return staticAsset(WEB_MANIFEST, "application/manifest+json");
+    if (request.method === "GET" && url.pathname === "/icon.svg") return staticAsset(ICON_SVG, "image/svg+xml");
+
+    // /v1/* is the gateway API; every other path is the phone's ash UI through the tunnel
+    // (the hub answers with the pairing page until this browser is a paired device).
     const api = url.pathname.startsWith("/v1/");
 
     // Browsers always send Origin on cross-site POST and WebSocket requests; native
@@ -38,3 +44,7 @@ export default {
     return hub.fetch(new Request(request, { headers }));
   },
 } satisfies ExportedHandler<Env>;
+
+function staticAsset(body: string, type: string): Response {
+  return new Response(body, { headers: { "content-type": type, "cache-control": "public, max-age=86400, immutable" } });
+}
