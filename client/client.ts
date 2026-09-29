@@ -229,7 +229,14 @@ export class Connection {
       ws.addEventListener("close", (ev) => resolve({ code: ev.code, reason: ev.reason }), { once: true });
     });
     ws.addEventListener("message", (ev) => {
-      const frame = JSON.parse(String(ev.data)) as Record<string, unknown>;
+      const text = String(ev.data);
+      if (text === "pong") return; // keepalive answer from the runtime (see "ping")
+      let frame: Record<string, unknown>;
+      try {
+        frame = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        return;
+      }
       const i = this.waiters.findIndex((w) => w.pred(frame));
       if (i >= 0) this.waiters.splice(i, 1)[0].resolve(frame);
       else this.frames.push(frame);
