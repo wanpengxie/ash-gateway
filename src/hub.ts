@@ -33,7 +33,7 @@ import {
 } from "./protocol";
 import { webLoginPage } from "./webui";
 
-export const GATEWAY_VERSION = "0.2.0";
+export const GATEWAY_VERSION = "0.3.0";
 
 interface Attachment {
   kind?: "device";
@@ -407,8 +407,10 @@ export class GatewayHub extends DurableObject<Env> {
     const me = att as Attachment | null;
     if (!me) return ws.close(4001, "no identity");
     if (typeof message !== "string") return this.reply(ws, { t: "gw", op: "error", code: "binary_not_supported" });
-    // Tunnel data from the phone rides in ~350 KB frames; everyone else stays at the relay limit.
-    const limit = me.role === "owner" ? LIMITS.maxTunnelFrameBytes : LIMITS.maxFrameBytes;
+    // Tunnel data rides in ~350 KB frames (phone, and devices that expose tools); everyone
+    // else stays at the relay limit.
+    const bigFrames = me.role === "owner" || this.canExpose(me.id);
+    const limit = bigFrames ? LIMITS.maxTunnelFrameBytes : LIMITS.maxFrameBytes;
     if (message.length > limit) return this.reply(ws, { t: "gw", op: "error", code: "frame_too_large" });
     let frame: Record<string, unknown>;
     try {
@@ -423,8 +425,14 @@ export class GatewayHub extends DurableObject<Env> {
     try {
       if (frame.t === "gw") await this.control(ws, me, dev, frame);
       else if (frame.t === "tun") {
-        if (me.role !== "owner") throw new ProtocolError("forbidden", "only the agent phone answers tunnels");
-        this.tunnelFromOwner(frame);
+        if (me.role === "owner") {
+          if (typeof frame.to === "string") this.tunnelToDevice(ws, me, frame);
+          else this.tunnelFromOwner(frame);
+        } else {
+          // A device that exposes tools answers the phone's tunnel requests; nothing else may tunnel.
+          if (!this.canExpose(me.id)) throw new ProtocolError("forbidden", "device may not expose capabilities");
+          this.sendToOwner({ ...frame, from: me.id });
+        }
       } else this.relay(ws, me, frame, message);
     } catch (e) {
       const code = e instanceof ProtocolError ? e.code : "internal";
@@ -659,6 +667,26 @@ export class GatewayHub extends DurableObject<Env> {
     }
     phone.send(JSON.stringify({ t: "tun", op: "http.reqend", sid }));
     return answer;
+  }
+
+  private canExpose(deviceId: string): boolean {
+    const d = this.device(deviceId);
+    return d !== null && d.role === "client" && !d.revoked && hasPermission(d, "expose_capability");
+  }
+
+  /**
+   * The phone opens a stream to one of its devices (e.g. to call that laptop's MCP tools).
+   * Only devices granted `expose_capability` receive tunnel traffic.
+   */
+  private tunnelToDevice(ws: WebSocket, me: Attachment, f: Record<string, unknown>): void {
+    const to = String(f.to);
+    const sid = String(f.sid ?? "");
+    const fail = (message: string) => this.reply(ws, { t: "tun", op: "http.error", sid, from: to, message });
+    if (!this.canExpose(to)) return fail("device is not allowed to expose capabilities");
+    const sockets = this.ctx.getWebSockets(`dev:${to}`);
+    if (sockets.length === 0) return fail("device_offline");
+    const text = JSON.stringify({ ...f, from: me.id });
+    for (const s of sockets) s.send(text);
   }
 
   /** Frames the phone sends back on a tunnel stream. */

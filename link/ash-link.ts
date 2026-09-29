@@ -7,23 +7,78 @@
 //     came from loopback (rewrites Host/Origin, attaches the engine's own session cookie);
 //   - serves a token-protected local page to create pairing codes and approve devices.
 //
-// Usage:  node ash-link.mjs --config <file>
-// config: { "gateway": "https://…workers.dev", "stateDir": "…", "engine": { "url": "http://127.0.0.1:3090",
-//           "log": "…/dsh-web.log" }, "control": { "port": 3095 }, "name": "agent phone" }
-// A file `<stateDir>/bootstrap-secret` is used (then deleted) for the one-time claim.
+//   - serves a token-protected local MCP proxy (default 127.0.0.1:3096) so the phone's DSH can
+//     call tools on paired devices: /d/<device id>/<server> is tunneled to that device.
+//
+// Role "client" (a laptop that lends its tools to the Agent):
+//   - pairs once with the one-time code from the phone (`--pair <code>`), then stays connected;
+//   - answers the phone's tunnel requests with its local MCP servers (stdio servers are bridged
+//     to Streamable HTTP in-process; URL servers are proxied).
+//
+// Usage:  node ash-link.mjs --config <file> [--pair <code>]
+// owner:  { "gateway": "https://…workers.dev", "stateDir": "…", "engine": { "url": "http://127.0.0.1:3090",
+//           "log": "…/dsh-web.log" }, "control": { "port": 3095 }, "mcpProxy": { "port": 3096 }, "name": "agent phone" }
+//         A file `<stateDir>/bootstrap-secret` is used (then deleted) for the one-time claim.
+// client: { "role": "client", "gateway": "…", "stateDir": "…", "name": "MacBook",
+//           "mcp": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/work"] },
+//                    "web":   { "url": "http://127.0.0.1:8931/mcp" } } }
 
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, readSync, closeSync, mkdirSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { Connection, DeviceKey, GatewayClient, GatewayError } from "../client/client";
 import { b64u, fromB64u, LIMITS, type Permission, randomToken, shortFingerprint } from "../src/protocol";
 
+type McpServer = { command: string; args?: string[]; env?: Record<string, string>; cwd?: string } | { url: string };
+
 interface Config {
+  role?: "owner" | "client";
   gateway: string;
   stateDir: string;
+  name?: string;
+  // owner
   engine: { url: string; log: string };
   control?: { port?: number };
-  name?: string;
+  mcpProxy?: { port?: number };
+  // client
+  mcp?: Record<string, McpServer>;
+}
+
+interface TunnelRequest {
+  method: string;
+  path: string;
+  headers: [string, string][];
+  body: Uint8Array[];
+}
+
+/** Stream an HTTP response back over the tunnel as http.head / http.body* / http.end. */
+async function streamBack(send: (f: Record<string, unknown>) => void, sid: string, res: Response, extra: Record<string, unknown> = {}): Promise<void> {
+  const headers: [string, string][] = [];
+  res.headers.forEach((v, k) => {
+    if (!/^(set-cookie|content-length|content-encoding|transfer-encoding|connection)$/i.test(k)) headers.push([k, v]);
+  });
+  send({ t: "tun", op: "http.head", sid, status: res.status, headers, ...extra });
+  if (res.body) {
+    let buf: Uint8Array[] = [];
+    let size = 0;
+    const flush = () => {
+      const all = Buffer.concat(buf);
+      for (let i = 0; i < all.length; i += LIMITS.tunnelChunkBytes) {
+        send({ t: "tun", op: "http.body", sid, data: b64u(new Uint8Array(all.subarray(i, i + LIMITS.tunnelChunkBytes))), ...extra });
+      }
+      buf = [];
+      size = 0;
+    };
+    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      buf.push(chunk);
+      size += chunk.length;
+      // SSE (MCP streaming) must not wait for a full chunk.
+      if (size >= LIMITS.tunnelChunkBytes || (res.headers.get("content-type") ?? "").includes("event-stream")) flush();
+    }
+    if (size) flush();
+  }
+  send({ t: "tun", op: "http.end", sid, ...extra });
 }
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
@@ -40,7 +95,11 @@ async function loadOrCreateKey(stateDir: string): Promise<DeviceKey> {
 }
 
 function controlToken(stateDir: string): string {
-  const file = join(stateDir, "control-token");
+  return secretToken(stateDir, "control-token");
+}
+
+function secretToken(stateDir: string, name: string): string {
+  const file = join(stateDir, name);
   if (existsSync(file)) return readFileSync(file, "utf8").trim();
   const t = randomToken(24);
   writeFileSync(file, t, { mode: 0o600 });
@@ -106,6 +165,8 @@ class Owner {
   private readonly httpReqs = new Map<string, { method: string; path: string; headers: [string, string][]; body: Uint8Array[] }>();
   private readonly sockets = new Map<string, { ws: WebSocket; queue: (string | Uint8Array)[]; parts: string[] }>();
   readonly pending = new Map<string, { request_id: string; client_id: string; name: string; pubkey: string; fingerprint: string; at: number }>();
+  /** Requests this phone sent to a device (MCP proxy), waiting for / streaming the device's answer. */
+  private readonly outbound = new Map<string, { head: (h: { status: number; headers: [string, string][] }) => void; data: (b: Uint8Array) => void; end: (err?: string) => void }>();
   connected = false;
 
   constructor(
@@ -151,6 +212,7 @@ class Owner {
   }
 
   private onFrame(f: Record<string, unknown>): void {
+    if (f.t === "tun" && typeof f.sid === "string" && this.outbound.has(f.sid)) return this.onOutbound(f);
     if (f.t === "gw" && f.op === "pair.request") {
       shortFingerprint(String(f.pubkey)).then((fingerprint) => {
         this.pending.set(String(f.request_id), { request_id: String(f.request_id), client_id: String(f.client_id), name: String(f.name), pubkey: String(f.pubkey), fingerprint, at: Date.now() });
@@ -198,7 +260,7 @@ class Owner {
     }
   }
 
-  private async proxyHttp(sid: string, req: { method: string; path: string; headers: [string, string][]; body: Uint8Array[] }): Promise<void> {
+  private async proxyHttp(sid: string, req: TunnelRequest): Promise<void> {
     const body = req.body.length ? Buffer.concat(req.body) : undefined;
     let res: Response | null = null;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -207,33 +269,7 @@ class Owner {
       if (res.status !== 401) break;
     }
     if (!res) throw new Error("engine unreachable");
-    const headers: [string, string][] = [];
-    res.headers.forEach((v, k) => {
-      if (!/^(set-cookie|content-length|content-encoding|transfer-encoding|connection)$/i.test(k)) headers.push([k, v]);
-    });
-    this.send({ t: "tun", op: "http.head", sid, status: res.status, headers });
-    if (res.body) {
-      let buf: Uint8Array[] = [];
-      let size = 0;
-      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-        buf.push(chunk);
-        size += chunk.length;
-        if (size >= LIMITS.tunnelChunkBytes) {
-          this.flushBody(sid, buf);
-          buf = [];
-          size = 0;
-        }
-      }
-      if (size) this.flushBody(sid, buf);
-    }
-    this.send({ t: "tun", op: "http.end", sid });
-  }
-
-  private flushBody(sid: string, parts: Uint8Array[]): void {
-    const all = Buffer.concat(parts);
-    for (let i = 0; i < all.length; i += LIMITS.tunnelChunkBytes) {
-      this.send({ t: "tun", op: "http.body", sid, data: b64u(new Uint8Array(all.subarray(i, i + LIMITS.tunnelChunkBytes))) });
-    }
+    await streamBack((f) => this.send(f), sid, res);
   }
 
   private openWs(sid: string, path: string): void {
@@ -267,6 +303,57 @@ class Owner {
         if (ws.readyState !== WebSocket.OPEN) this.send({ t: "tun", op: "ws.error", sid, message: "engine websocket failed" });
       });
     });
+  }
+
+  private onOutbound(f: Record<string, unknown>): void {
+    const o = this.outbound.get(String(f.sid))!;
+    switch (f.op) {
+      case "http.head":
+        return o.head({ status: Number(f.status), headers: (f.headers as [string, string][]) ?? [] });
+      case "http.body":
+        return o.data(fromB64u(String(f.data)));
+      case "http.end":
+        this.outbound.delete(String(f.sid));
+        return o.end();
+      case "http.error":
+        this.outbound.delete(String(f.sid));
+        return o.end(String(f.message ?? "tunnel error"));
+    }
+  }
+
+  /** Send one HTTP request to a paired device through the gateway; the answer streams into `res`. */
+  forward(to: string, req: TunnelRequest, res: ServerResponse): void {
+    if (!this.conn) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "offline", message: "not connected to the gateway" }));
+      return;
+    }
+    const sid = randomToken(12);
+    let started = false;
+    const timer = setTimeout(() => this.outbound.get(sid)?.end("device did not answer in time"), 150_000);
+    this.outbound.set(sid, {
+      head: ({ status, headers }) => {
+        started = true;
+        res.writeHead(status, Object.fromEntries(headers.filter(([k]) => !/^(content-length|transfer-encoding|connection)$/i.test(k))));
+      },
+      data: (b) => res.write(b),
+      end: (err) => {
+        clearTimeout(timer);
+        this.outbound.delete(sid);
+        if (err && !started) {
+          res.writeHead(err === "device_offline" ? 503 : 502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: err }));
+        } else res.end();
+      },
+    });
+    this.send({ t: "tun", op: "http.req", sid, to, method: req.method, path: req.path, headers: req.headers });
+    const body = req.body.length ? Buffer.concat(req.body) : null;
+    if (body) {
+      for (let i = 0; i < body.length; i += LIMITS.tunnelChunkBytes) {
+        this.send({ t: "tun", op: "http.reqbody", sid, to, data: b64u(new Uint8Array(body.subarray(i, i + LIMITS.tunnelChunkBytes))) });
+      }
+    }
+    this.send({ t: "tun", op: "http.reqend", sid, to });
   }
 
   // ---------------------------------------------------------------- owner operations (control page)
@@ -375,15 +462,195 @@ let ticket=null;
 async function render(){const s=await fetch("/api/state").then(r=>r.json());
 let h='<section><h2>网关</h2><p>'+(s.connected?"🟢 已连接":"🔴 未连接")+' <span class="muted">'+esc(s.gateway)+'</span></p><p class="muted">手机指纹 <code>'+esc(s.owner_fingerprint)+'</code></p></section>';
 h+='<section><h2>添加设备</h2><button onclick="mk()">生成配对码</button>'+(ticket?'<p>在新设备上打开 <code>'+esc(s.gateway)+'</code>，粘贴配对码（5 分钟内有效）：</p><p><code>'+esc(ticket)+'</code></p>':'')+'</section>';
-h+='<section><h2>待确认</h2>'+(s.pending.length?s.pending.map(p=>'<p><b>'+esc(p.name)+'</b><br><span class="muted">设备指纹</span> <code>'+esc(p.fingerprint)+'</code><br><label><input type="checkbox" id="w_'+p.request_id+'" checked> 网页端（完整界面）</label><br><button onclick="ok(\\''+p.request_id+'\\')">批准</button><button class="gray" onclick="no(\\''+p.request_id+'\\')">拒绝</button></p>').join(''):'<p class="muted">没有</p>')+'</section>';
+h+='<section><h2>待确认</h2>'+(s.pending.length?s.pending.map(p=>'<p><b>'+esc(p.name)+'</b><br><span class="muted">设备指纹</span> <code>'+esc(p.fingerprint)+'</code><br><label><input type="checkbox" id="w_'+p.request_id+'" checked> 网页端（完整界面）</label><br><label><input type="checkbox" id="x_'+p.request_id+'"> 开放本机工具给 Agent（笔记本等）</label><br><button onclick="ok(\\''+p.request_id+'\\')">批准</button><button class="gray" onclick="no(\\''+p.request_id+'\\')">拒绝</button></p>').join(''):'<p class="muted">没有</p>')+'</section>';
 h+='<section><h2>已配对</h2>'+(s.devices.length?s.devices.map(d=>'<p>'+(d.online?"🟢 ":"⚪️ ")+esc(d.name)+' <span class="muted">'+esc(d.permissions.join(", "))+(d.revoked?" · 已撤销":"")+'</span>'+(d.revoked?'':' <button class="gray" onclick="rv(\\''+d.id+'\\')">撤销</button>')+'</p>').join(''):'<p class="muted">没有</p>')+'</section>';
 document.getElementById("v").innerHTML=h;}
 async function mk(){const r=await post("/api/ticket");ticket=r.ticket;render();}
-async function ok(id){const perms=["chat"];if(document.getElementById("w_"+id).checked)perms.push("web_ui");await post("/api/approve",{request_id:id,permissions:perms});render();}
+async function ok(id){const perms=["chat"];if(document.getElementById("w_"+id).checked)perms.push("web_ui");if(document.getElementById("x_"+id).checked)perms.push("expose_capability");await post("/api/approve",{request_id:id,permissions:perms});render();}
 async function no(id){await post("/api/reject",{request_id:id});render();}
 async function rv(id){if(confirm("撤销这个设备？"))await post("/api/revoke",{client_id:id});render();}
 render();setInterval(render,3000);
 </script></body></html>`;
+
+// ------------------------------------------------------------------ owner: MCP proxy for DSH
+
+/**
+ * Local Streamable-HTTP endpoint for the phone's DSH `dsh-mcp-client`:
+ *   http://127.0.0.1:<port>/d/<device id>/<server>   (header x-ash-link: <mcp token>)
+ * Everything is forwarded unchanged to `/mcp/<server>` on that device through the gateway.
+ */
+function serveMcpProxy(owner: Owner, port: number, token: string): void {
+  createServer((req, res) => {
+    if (req.headers["x-ash-link"] !== token) {
+      res.writeHead(401).end("unauthorized");
+      return;
+    }
+    const m = /^\/d\/([A-Za-z0-9_-]{22})\/([A-Za-z0-9_-]{1,32})(\/.*)?$/.exec(new URL(req.url ?? "/", "http://x").pathname);
+    if (!m) {
+      res.writeHead(404).end("use /d/<device id>/<server>");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const headers: [string, string][] = [];
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === "string" && !/^(host|connection|content-length|x-ash-link|transfer-encoding)$/i.test(k)) headers.push([k, v]);
+      }
+      owner.forward(m[1], { method: req.method ?? "GET", path: `/mcp/${m[2]}${m[3] ?? ""}`, headers, body: chunks.length ? [Buffer.concat(chunks)] : [] }, res);
+    });
+  }).listen(port, "127.0.0.1", () => log(`MCP proxy for DSH on http://127.0.0.1:${port}/d/<device>/<server>`));
+}
+
+// ------------------------------------------------------------------ client: local MCP servers
+
+/**
+ * Minimal Streamable-HTTP front for a stdio MCP server: each POST carries one JSON-RPC
+ * message (or a batch); requests are answered with their responses as JSON, notifications
+ * with 202. Server-initiated streams (GET) are not offered (405), which the spec allows.
+ */
+class StdioMcp {
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private readonly waiting = new Map<string, (msg: unknown) => void>();
+  private buf = "";
+
+  constructor(
+    readonly name: string,
+    private readonly spec: { command: string; args?: string[]; env?: Record<string, string>; cwd?: string },
+  ) {}
+
+  private ensure(): ChildProcessWithoutNullStreams {
+    if (this.child && this.child.exitCode === null) return this.child;
+    const child = spawn(this.spec.command, this.spec.args ?? [], { cwd: this.spec.cwd, env: { ...process.env, ...this.spec.env }, stdio: ["pipe", "pipe", "pipe"] });
+    child.stderr.on("data", (d) => log(`[mcp ${this.name}]`, String(d).trim()));
+    child.stdout.on("data", (d) => {
+      this.buf += String(d);
+      let nl: number;
+      while ((nl = this.buf.indexOf("\n")) >= 0) {
+        const line = this.buf.slice(0, nl).trim();
+        this.buf = this.buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line) as { id?: unknown; method?: string };
+          const key = JSON.stringify(msg.id);
+          if (msg.id !== undefined && msg.method === undefined && this.waiting.has(key)) {
+            this.waiting.get(key)!(msg);
+            this.waiting.delete(key);
+          }
+        } catch {
+          log(`[mcp ${this.name}] non-JSON output:`, line.slice(0, 200));
+        }
+      }
+    });
+    child.on("exit", (code) => {
+      log(`[mcp ${this.name}] exited`, code);
+      for (const [, w] of this.waiting) w({ jsonrpc: "2.0", id: null, error: { code: -32000, message: "MCP server exited" } });
+      this.waiting.clear();
+    });
+    this.child = child;
+    log(`[mcp ${this.name}] started: ${this.spec.command} ${(this.spec.args ?? []).join(" ")}`);
+    return child;
+  }
+
+  async handle(method: string, bodyText: string): Promise<Response> {
+    if (method === "GET") return new Response(null, { status: 405, headers: { allow: "POST, DELETE" } });
+    if (method === "DELETE") return new Response(null, { status: 200 });
+    if (method !== "POST") return new Response(null, { status: 405 });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch {
+      return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, { status: 400 });
+    }
+    const msgs = (Array.isArray(parsed) ? parsed : [parsed]) as { id?: unknown; method?: string }[];
+    const child = this.ensure();
+    const answers = msgs
+      .filter((m) => m.method !== undefined && m.id !== undefined)
+      .map(
+        (m) =>
+          new Promise<unknown>((resolve) => {
+            const key = JSON.stringify(m.id);
+            const t = setTimeout(() => {
+              this.waiting.delete(key);
+              resolve({ jsonrpc: "2.0", id: m.id, error: { code: -32001, message: "MCP server timed out" } });
+            }, 120_000);
+            this.waiting.set(key, (msg) => (clearTimeout(t), resolve(msg)));
+          }),
+      );
+    for (const m of msgs) child.stdin.write(JSON.stringify(m) + "\n");
+    if (answers.length === 0) return new Response(null, { status: 202 });
+    const out = await Promise.all(answers);
+    return Response.json(Array.isArray(parsed) ? out : out[0]);
+  }
+}
+
+class Device {
+  private conn: Connection | null = null;
+  private readonly reqs = new Map<string, TunnelRequest>();
+  private readonly stdio = new Map<string, StdioMcp>();
+
+  constructor(
+    readonly gw: GatewayClient,
+    private readonly servers: Record<string, McpServer>,
+  ) {
+    for (const [name, spec] of Object.entries(servers)) if ("command" in spec) this.stdio.set(name, new StdioMcp(name, spec));
+  }
+
+  async run(): Promise<never> {
+    let delay = 1000;
+    for (;;) {
+      try {
+        const conn = await this.gw.connect(await this.gw.authenticate());
+        this.conn = conn;
+        delay = 1000;
+        log(`connected to gateway as device ${this.gw.key.id}; serving MCP: ${Object.keys(this.servers).join(", ") || "(none)"}`);
+        conn.onUnmatched = (f) => this.onFrame(f);
+        const keepalive = setInterval(() => conn.ws.readyState === WebSocket.OPEN && conn.ws.send("ping"), 30_000);
+        const closed = await conn.closed;
+        clearInterval(keepalive);
+        log("gateway connection closed", closed.code, closed.reason);
+        if (closed.code === 4003) throw new Error("this device was revoked by the phone");
+      } catch (e) {
+        log("gateway connection failed:", e instanceof Error ? e.message : e);
+        if (e instanceof Error && /revoked/.test(e.message)) process.exit(2);
+      }
+      this.conn = null;
+      this.reqs.clear();
+      await sleep(delay * (0.5 + Math.random() / 2));
+      delay = Math.min(delay * 2, 30_000);
+    }
+  }
+
+  private send(f: Record<string, unknown>): void {
+    const c = this.conn;
+    if (c && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(f));
+  }
+
+  private onFrame(f: Record<string, unknown>): void {
+    if (f.t !== "tun") return;
+    const sid = String(f.sid);
+    if (f.op === "http.req") this.reqs.set(sid, { method: String(f.method), path: String(f.path), headers: (f.headers as [string, string][]) ?? [], body: [] });
+    else if (f.op === "http.reqbody") this.reqs.get(sid)?.body.push(fromB64u(String(f.data)));
+    else if (f.op === "http.reqend") {
+      const req = this.reqs.get(sid);
+      this.reqs.delete(sid);
+      if (req) this.serve(sid, req).catch((e) => this.send({ t: "tun", op: "http.error", sid, message: String(e?.message ?? e) }));
+    }
+  }
+
+  private async serve(sid: string, req: TunnelRequest): Promise<void> {
+    const m = /^\/mcp\/([A-Za-z0-9_-]{1,32})(\/.*)?$/.exec(req.path.split("?")[0]);
+    const spec = m ? this.servers[m[1]] : undefined;
+    let res: Response;
+    if (!m || !spec) res = Response.json({ error: "unknown_server", servers: Object.keys(this.servers) }, { status: 404 });
+    else if ("url" in spec) {
+      const headers = new Headers();
+      for (const [k, v] of req.headers) if (!/^(host|origin|cookie)$/i.test(k)) headers.append(k, v);
+      res = await fetch(spec.url + (m[2] ?? ""), { method: req.method, headers, body: req.body.length ? Buffer.concat(req.body) : undefined });
+    } else res = await this.stdio.get(m[1])!.handle(req.method, Buffer.concat(req.body).toString("utf8"));
+    await streamBack((f) => this.send(f), sid, res);
+  }
+}
 
 // ------------------------------------------------------------------ main
 
@@ -392,13 +659,33 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const i = process.argv.indexOf("--config");
-  if (i < 0) throw new Error("usage: ash-link --config <file>");
-  const cfg = JSON.parse(readFileSync(process.argv[i + 1], "utf8")) as Config;
+  const arg = (flag: string) => {
+    const i = process.argv.indexOf(flag);
+    return i >= 0 ? process.argv[i + 1] : undefined;
+  };
+  const cfgPath = arg("--config");
+  if (!cfgPath) throw new Error("usage: ash-link --config <file> [--pair <code>]");
+  const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as Config;
   mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 });
   const key = await loadOrCreateKey(cfg.stateDir);
   const gw = new GatewayClient(cfg.gateway, key);
   const fingerprint = await shortFingerprint(key.publicKey);
+
+  if (cfg.role === "client") {
+    const pairedFile = join(cfg.stateDir, "paired.json");
+    if (!existsSync(pairedFile)) {
+      const code = arg("--pair");
+      if (!code) throw new Error("not paired yet: run once with --pair <code from the phone>");
+      const pr = await gw.requestPairing(code, cfg.name ?? "laptop");
+      log(`pairing requested. Confirm on the phone: this device ${fingerprint}, phone ${pr.owner_fingerprint}`);
+      const grant = await gw.waitForApproval(pr.request_id, pr.owner_key, 10 * 60_000);
+      writeFileSync(pairedFile, JSON.stringify({ owner_key: pr.owner_key, owner_id: pr.owner_id, ...grant }), { mode: 0o600 });
+      log("paired with permissions", grant.permissions.join(", "));
+      if (!grant.permissions.includes("expose_capability")) log("note: the phone did not grant expose_capability, so it cannot call this device's tools");
+    }
+    await new Device(gw, cfg.mcp ?? {}).run();
+    return;
+  }
 
   // One-time claim, retried until the gateway answers.
   for (;;) {
@@ -422,6 +709,7 @@ async function main(): Promise<void> {
 
   const owner = new Owner(gw, new Engine(cfg.engine));
   serveControl(owner, cfg.control?.port ?? 3095, controlToken(cfg.stateDir), fingerprint);
+  serveMcpProxy(owner, cfg.mcpProxy?.port ?? 3096, secretToken(cfg.stateDir, "mcp-token"));
   await owner.run();
 }
 

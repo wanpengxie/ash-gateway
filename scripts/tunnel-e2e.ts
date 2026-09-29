@@ -19,6 +19,7 @@ const BASE = (process.env.GATEWAY_URL ?? "http://127.0.0.1:8787").replace(/\/$/,
 const SECRET = process.env.BOOTSTRAP_SECRET ?? "";
 const ENGINE_PORT = 39090;
 const CONTROL_PORT = 39095;
+const MCP_PORT = 39096;
 const BIG = randomBytes(1024 * 1024 + 123); // forces several tunnel chunks
 
 let passed = 0;
@@ -99,9 +100,8 @@ async function main(): Promise<void> {
   // ---------------------------------------------------------------- phone: ash-link
   const stateDir = join(dir, "state");
   const cfgFile = join(dir, "link.json");
-  writeFileSync(cfgFile, JSON.stringify({ gateway: BASE, stateDir, engine: { url: `http://127.0.0.1:${ENGINE_PORT}`, log: engineLog }, control: { port: CONTROL_PORT }, name: "tunnel-e2e phone" }));
-  const { mkdirSync } = await import("node:fs");
-  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(cfgFile, JSON.stringify({ gateway: BASE, stateDir, engine: { url: `http://127.0.0.1:${ENGINE_PORT}`, log: engineLog }, control: { port: CONTROL_PORT }, mcpProxy: { port: MCP_PORT }, name: "tunnel-e2e phone" }));
+  (await import("node:fs")).mkdirSync(stateDir, { recursive: true });
   writeFileSync(join(stateDir, "bootstrap-secret"), SECRET);
   const link = spawn(process.execPath, ["dist/ash-link.mjs", "--config", cfgFile], { stdio: ["ignore", "pipe", "pipe"] });
   let linkOut = "";
@@ -112,7 +112,7 @@ async function main(): Promise<void> {
   console.log(`gateway ${BASE}\nphone`);
   for (let i = 0; i < 60 && !linkOut.includes("connected to gateway"); i++) await sleep(500);
   ok(linkOut.includes("claimed the gateway") && linkOut.includes("connected to gateway"), "ash-link claims the gateway and connects as owner");
-  const { readFileSync } = await import("node:fs");
+  const { readFileSync, mkdirSync } = await import("node:fs");
   const ctl = readFileSync(join(stateDir, "control-token"), "utf8").trim();
   const control = (path: string, body?: unknown) =>
     fetch(`http://127.0.0.1:${CONTROL_PORT}${path}`, { method: body ? "POST" : "GET", headers: { "x-ash-link": ctl, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json() as Promise<Record<string, unknown>>);
@@ -178,6 +178,60 @@ async function main(): Promise<void> {
   ok(denied.status === 403, "a device without web_ui cannot open the UI");
   const noCookie = await fetch(`${BASE}/api/echo`, { method: "POST", body: "{}" });
   ok(noCookie.status === 401, "API calls without a session never reach the phone");
+
+  // ---------------------------------------------------------------- laptop exposes MCP tools
+  console.log("laptop");
+  const fakeMcp = join(dir, "fake-mcp.mjs");
+  writeFileSync(
+    fakeMcp,
+    `import { createInterface } from "node:readline";
+const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+createInterface({ input: process.stdin }).on("line", (l) => {
+  const m = JSON.parse(l);
+  if (m.method === "initialize") out({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } } });
+  else if (m.method === "tools/list") out({ jsonrpc: "2.0", id: m.id, result: { tools: [{ name: "echo", description: "echo", inputSchema: { type: "object", properties: { text: { type: "string" } } } }] } });
+  else if (m.method === "tools/call") out({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "laptop says: " + m.params.arguments.text }] } });
+});`,
+  );
+  const lapDir = join(dir, "laptop");
+  mkdirSync(lapDir, { recursive: true });
+  const lapCfg = join(dir, "laptop.json");
+  writeFileSync(lapCfg, JSON.stringify({ role: "client", gateway: BASE, stateDir: lapDir, name: "e2e laptop", mcp: { fake: { command: process.execPath, args: [fakeMcp] } } }));
+  const { ticket: lapTicket } = (await control("/api/ticket", {})) as { ticket: string };
+  const laptop = spawn(process.execPath, ["dist/ash-link.mjs", "--config", lapCfg, "--pair", lapTicket], { stdio: ["ignore", "pipe", "pipe"] });
+  let lapOut = "";
+  laptop.stdout.on("data", (d) => (lapOut += d));
+  laptop.stderr.on("data", (d) => (lapOut += d));
+  process.on("exit", () => laptop.kill());
+  let req: { request_id: string; name: string } | undefined;
+  for (let i = 0; i < 40 && !req; i++) {
+    await sleep(500);
+    req = ((await control("/api/state")).pending as { request_id: string; name: string }[]).find((p) => p.name === "e2e laptop");
+  }
+  ok(req, "the phone sees the laptop's pairing request");
+  await control("/api/approve", { request_id: req!.request_id, permissions: ["chat", "expose_capability"] });
+  for (let i = 0; i < 40 && !lapOut.includes("connected to gateway as device"); i++) await sleep(500);
+  ok(lapOut.includes("paired with permissions chat, expose_capability") && lapOut.includes("connected to gateway as device"), "laptop verifies the approval and connects as a device");
+  const lapId = (((await control("/api/state")).devices as { id: string; name: string }[]).find((d) => d.name === "e2e laptop") ?? { id: "" }).id;
+  const mcpTok = readFileSync(join(stateDir, "mcp-token"), "utf8").trim();
+  const rpc = async (dev: string, server: string, body: unknown, tok = mcpTok) => {
+    const r = await fetch(`http://127.0.0.1:${MCP_PORT}/d/${dev}/${server}`, { method: "POST", headers: { "x-ash-link": tok, "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify(body) });
+    return { status: r.status, body: r.status === 202 ? null : ((await r.json().catch(() => null)) as Record<string, any> | null) };
+  };
+  ok((await rpc(lapId, "fake", {}, "wrong")).status === 401, "the local MCP proxy refuses callers without its token");
+  const init = await rpc(lapId, "fake", { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2026-07-28", capabilities: {}, clientInfo: { name: "dsh", version: "0" } } });
+  ok(init.status === 200 && init.body?.result?.serverInfo?.name === "fake", "MCP initialize reaches the laptop's stdio server through the gateway");
+  ok((await rpc(lapId, "fake", { jsonrpc: "2.0", method: "notifications/initialized" })).status === 202, "notifications are accepted without a body");
+  const list = await rpc(lapId, "fake", { jsonrpc: "2.0", id: 2, method: "tools/list" });
+  ok(list.body?.result?.tools?.[0]?.name === "echo", "tools/list returns the laptop's tools");
+  const call = await rpc(lapId, "fake", { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "echo", arguments: { text: "你好" } } });
+  ok(call.body?.result?.content?.[0]?.text === "laptop says: 你好", "tools/call runs on the laptop and the result comes back");
+  ok((await rpc(lapId, "nope", { jsonrpc: "2.0", id: 4, method: "tools/list" })).status === 404, "unknown server names are refused by the laptop");
+  const chatOnlyId = (((await control("/api/state")).devices as { id: string; name: string }[]).find((d) => d.name === "e2e chat-only") ?? { id: "" }).id;
+  ok((await rpc(chatOnlyId, "fake", { jsonrpc: "2.0", id: 5, method: "tools/list" })).status === 502, "devices without expose_capability receive no tunnel traffic");
+  laptop.kill();
+  await sleep(1500);
+  ok((await rpc(lapId, "fake", { jsonrpc: "2.0", id: 6, method: "tools/list" })).status === 503, "a laptop that went away reports device_offline");
 
   // ---------------------------------------------------------------- phone goes away
   console.log("offline");

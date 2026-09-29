@@ -1,4 +1,5 @@
 // link/ash-link.ts
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, readSync, closeSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -10,6 +11,8 @@ var LIMITS = {
   maxBodyBytes: 16 * 1024,
   /** One WebSocket frame (envelope or control). */
   maxFrameBytes: 64 * 1024,
+  /** One tunnel frame from the phone (Cloudflare's WebSocket message cap is 1 MiB). */
+  maxTunnelFrameBytes: 1024 * 1024 - 1024,
   challengeTtlMs: 6e4,
   sessionTtlMs: 15 * 6e4,
   pairTicketMaxTtlMs: 5 * 6e4,
@@ -384,6 +387,32 @@ var Connection = class {
 };
 
 // link/ash-link.ts
+async function streamBack(send, sid, res, extra = {}) {
+  const headers = [];
+  res.headers.forEach((v, k) => {
+    if (!/^(set-cookie|content-length|content-encoding|transfer-encoding|connection)$/i.test(k)) headers.push([k, v]);
+  });
+  send({ t: "tun", op: "http.head", sid, status: res.status, headers, ...extra });
+  if (res.body) {
+    let buf = [];
+    let size = 0;
+    const flush = () => {
+      const all = Buffer.concat(buf);
+      for (let i = 0; i < all.length; i += LIMITS.tunnelChunkBytes) {
+        send({ t: "tun", op: "http.body", sid, data: b64u(new Uint8Array(all.subarray(i, i + LIMITS.tunnelChunkBytes))), ...extra });
+      }
+      buf = [];
+      size = 0;
+    };
+    for await (const chunk of res.body) {
+      buf.push(chunk);
+      size += chunk.length;
+      if (size >= LIMITS.tunnelChunkBytes || (res.headers.get("content-type") ?? "").includes("event-stream")) flush();
+    }
+    if (size) flush();
+  }
+  send({ t: "tun", op: "http.end", sid, ...extra });
+}
 var log = (...a) => console.log((/* @__PURE__ */ new Date()).toISOString(), ...a);
 async function loadOrCreateKey(stateDir) {
   const file = join(stateDir, "device.jwk");
@@ -394,7 +423,10 @@ async function loadOrCreateKey(stateDir) {
   return key;
 }
 function controlToken(stateDir) {
-  const file = join(stateDir, "control-token");
+  return secretToken(stateDir, "control-token");
+}
+function secretToken(stateDir, name) {
+  const file = join(stateDir, name);
   if (existsSync(file)) return readFileSync(file, "utf8").trim();
   const t = randomToken(24);
   writeFileSync(file, t, { mode: 384 });
@@ -457,6 +489,8 @@ var Owner = class {
   httpReqs = /* @__PURE__ */ new Map();
   sockets = /* @__PURE__ */ new Map();
   pending = /* @__PURE__ */ new Map();
+  /** Requests this phone sent to a device (MCP proxy), waiting for / streaming the device's answer. */
+  outbound = /* @__PURE__ */ new Map();
   connected = false;
   async run() {
     let delay = 1e3;
@@ -494,6 +528,7 @@ var Owner = class {
     if (c && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(frame));
   }
   onFrame(f) {
+    if (f.t === "tun" && typeof f.sid === "string" && this.outbound.has(f.sid)) return this.onOutbound(f);
     if (f.t === "gw" && f.op === "pair.request") {
       shortFingerprint(String(f.pubkey)).then((fingerprint) => {
         this.pending.set(String(f.request_id), { request_id: String(f.request_id), client_id: String(f.client_id), name: String(f.name), pubkey: String(f.pubkey), fingerprint, at: Date.now() });
@@ -549,32 +584,7 @@ var Owner = class {
       if (res.status !== 401) break;
     }
     if (!res) throw new Error("engine unreachable");
-    const headers = [];
-    res.headers.forEach((v, k) => {
-      if (!/^(set-cookie|content-length|content-encoding|transfer-encoding|connection)$/i.test(k)) headers.push([k, v]);
-    });
-    this.send({ t: "tun", op: "http.head", sid, status: res.status, headers });
-    if (res.body) {
-      let buf = [];
-      let size = 0;
-      for await (const chunk of res.body) {
-        buf.push(chunk);
-        size += chunk.length;
-        if (size >= LIMITS.tunnelChunkBytes) {
-          this.flushBody(sid, buf);
-          buf = [];
-          size = 0;
-        }
-      }
-      if (size) this.flushBody(sid, buf);
-    }
-    this.send({ t: "tun", op: "http.end", sid });
-  }
-  flushBody(sid, parts) {
-    const all = Buffer.concat(parts);
-    for (let i = 0; i < all.length; i += LIMITS.tunnelChunkBytes) {
-      this.send({ t: "tun", op: "http.body", sid, data: b64u(new Uint8Array(all.subarray(i, i + LIMITS.tunnelChunkBytes))) });
-    }
+    await streamBack((f) => this.send(f), sid, res);
   }
   openWs(sid, path) {
     this.engine.auth().then((cookie) => {
@@ -607,6 +617,55 @@ var Owner = class {
         if (ws.readyState !== WebSocket.OPEN) this.send({ t: "tun", op: "ws.error", sid, message: "engine websocket failed" });
       });
     });
+  }
+  onOutbound(f) {
+    const o = this.outbound.get(String(f.sid));
+    switch (f.op) {
+      case "http.head":
+        return o.head({ status: Number(f.status), headers: f.headers ?? [] });
+      case "http.body":
+        return o.data(fromB64u(String(f.data)));
+      case "http.end":
+        this.outbound.delete(String(f.sid));
+        return o.end();
+      case "http.error":
+        this.outbound.delete(String(f.sid));
+        return o.end(String(f.message ?? "tunnel error"));
+    }
+  }
+  /** Send one HTTP request to a paired device through the gateway; the answer streams into `res`. */
+  forward(to, req, res) {
+    if (!this.conn) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "offline", message: "not connected to the gateway" }));
+      return;
+    }
+    const sid = randomToken(12);
+    let started = false;
+    const timer = setTimeout(() => this.outbound.get(sid)?.end("device did not answer in time"), 15e4);
+    this.outbound.set(sid, {
+      head: ({ status, headers }) => {
+        started = true;
+        res.writeHead(status, Object.fromEntries(headers.filter(([k]) => !/^(content-length|transfer-encoding|connection)$/i.test(k))));
+      },
+      data: (b) => res.write(b),
+      end: (err) => {
+        clearTimeout(timer);
+        this.outbound.delete(sid);
+        if (err && !started) {
+          res.writeHead(err === "device_offline" ? 503 : 502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: err }));
+        } else res.end();
+      }
+    });
+    this.send({ t: "tun", op: "http.req", sid, to, method: req.method, path: req.path, headers: req.headers });
+    const body = req.body.length ? Buffer.concat(req.body) : null;
+    if (body) {
+      for (let i = 0; i < body.length; i += LIMITS.tunnelChunkBytes) {
+        this.send({ t: "tun", op: "http.reqbody", sid, to, data: b64u(new Uint8Array(body.subarray(i, i + LIMITS.tunnelChunkBytes))) });
+      }
+    }
+    this.send({ t: "tun", op: "http.reqend", sid, to });
   }
   // ---------------------------------------------------------------- owner operations (control page)
   async grant() {
@@ -701,26 +760,200 @@ let ticket=null;
 async function render(){const s=await fetch("/api/state").then(r=>r.json());
 let h='<section><h2>\u7F51\u5173</h2><p>'+(s.connected?"\u{1F7E2} \u5DF2\u8FDE\u63A5":"\u{1F534} \u672A\u8FDE\u63A5")+' <span class="muted">'+esc(s.gateway)+'</span></p><p class="muted">\u624B\u673A\u6307\u7EB9 <code>'+esc(s.owner_fingerprint)+'</code></p></section>';
 h+='<section><h2>\u6DFB\u52A0\u8BBE\u5907</h2><button onclick="mk()">\u751F\u6210\u914D\u5BF9\u7801</button>'+(ticket?'<p>\u5728\u65B0\u8BBE\u5907\u4E0A\u6253\u5F00 <code>'+esc(s.gateway)+'</code>\uFF0C\u7C98\u8D34\u914D\u5BF9\u7801\uFF085 \u5206\u949F\u5185\u6709\u6548\uFF09\uFF1A</p><p><code>'+esc(ticket)+'</code></p>':'')+'</section>';
-h+='<section><h2>\u5F85\u786E\u8BA4</h2>'+(s.pending.length?s.pending.map(p=>'<p><b>'+esc(p.name)+'</b><br><span class="muted">\u8BBE\u5907\u6307\u7EB9</span> <code>'+esc(p.fingerprint)+'</code><br><label><input type="checkbox" id="w_'+p.request_id+'" checked> \u7F51\u9875\u7AEF\uFF08\u5B8C\u6574\u754C\u9762\uFF09</label><br><button onclick="ok(\\''+p.request_id+'\\')">\u6279\u51C6</button><button class="gray" onclick="no(\\''+p.request_id+'\\')">\u62D2\u7EDD</button></p>').join(''):'<p class="muted">\u6CA1\u6709</p>')+'</section>';
+h+='<section><h2>\u5F85\u786E\u8BA4</h2>'+(s.pending.length?s.pending.map(p=>'<p><b>'+esc(p.name)+'</b><br><span class="muted">\u8BBE\u5907\u6307\u7EB9</span> <code>'+esc(p.fingerprint)+'</code><br><label><input type="checkbox" id="w_'+p.request_id+'" checked> \u7F51\u9875\u7AEF\uFF08\u5B8C\u6574\u754C\u9762\uFF09</label><br><label><input type="checkbox" id="x_'+p.request_id+'"> \u5F00\u653E\u672C\u673A\u5DE5\u5177\u7ED9 Agent\uFF08\u7B14\u8BB0\u672C\u7B49\uFF09</label><br><button onclick="ok(\\''+p.request_id+'\\')">\u6279\u51C6</button><button class="gray" onclick="no(\\''+p.request_id+'\\')">\u62D2\u7EDD</button></p>').join(''):'<p class="muted">\u6CA1\u6709</p>')+'</section>';
 h+='<section><h2>\u5DF2\u914D\u5BF9</h2>'+(s.devices.length?s.devices.map(d=>'<p>'+(d.online?"\u{1F7E2} ":"\u26AA\uFE0F ")+esc(d.name)+' <span class="muted">'+esc(d.permissions.join(", "))+(d.revoked?" \xB7 \u5DF2\u64A4\u9500":"")+'</span>'+(d.revoked?'':' <button class="gray" onclick="rv(\\''+d.id+'\\')">\u64A4\u9500</button>')+'</p>').join(''):'<p class="muted">\u6CA1\u6709</p>')+'</section>';
 document.getElementById("v").innerHTML=h;}
 async function mk(){const r=await post("/api/ticket");ticket=r.ticket;render();}
-async function ok(id){const perms=["chat"];if(document.getElementById("w_"+id).checked)perms.push("web_ui");await post("/api/approve",{request_id:id,permissions:perms});render();}
+async function ok(id){const perms=["chat"];if(document.getElementById("w_"+id).checked)perms.push("web_ui");if(document.getElementById("x_"+id).checked)perms.push("expose_capability");await post("/api/approve",{request_id:id,permissions:perms});render();}
 async function no(id){await post("/api/reject",{request_id:id});render();}
 async function rv(id){if(confirm("\u64A4\u9500\u8FD9\u4E2A\u8BBE\u5907\uFF1F"))await post("/api/revoke",{client_id:id});render();}
 render();setInterval(render,3000);
 </script></body></html>`;
+function serveMcpProxy(owner, port, token) {
+  createServer((req, res) => {
+    if (req.headers["x-ash-link"] !== token) {
+      res.writeHead(401).end("unauthorized");
+      return;
+    }
+    const m = /^\/d\/([A-Za-z0-9_-]{22})\/([A-Za-z0-9_-]{1,32})(\/.*)?$/.exec(new URL(req.url ?? "/", "http://x").pathname);
+    if (!m) {
+      res.writeHead(404).end("use /d/<device id>/<server>");
+      return;
+    }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const headers = [];
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === "string" && !/^(host|connection|content-length|x-ash-link|transfer-encoding)$/i.test(k)) headers.push([k, v]);
+      }
+      owner.forward(m[1], { method: req.method ?? "GET", path: `/mcp/${m[2]}${m[3] ?? ""}`, headers, body: chunks.length ? [Buffer.concat(chunks)] : [] }, res);
+    });
+  }).listen(port, "127.0.0.1", () => log(`MCP proxy for DSH on http://127.0.0.1:${port}/d/<device>/<server>`));
+}
+var StdioMcp = class {
+  constructor(name, spec) {
+    this.name = name;
+    this.spec = spec;
+  }
+  name;
+  spec;
+  child = null;
+  waiting = /* @__PURE__ */ new Map();
+  buf = "";
+  ensure() {
+    if (this.child && this.child.exitCode === null) return this.child;
+    const child = spawn(this.spec.command, this.spec.args ?? [], { cwd: this.spec.cwd, env: { ...process.env, ...this.spec.env }, stdio: ["pipe", "pipe", "pipe"] });
+    child.stderr.on("data", (d) => log(`[mcp ${this.name}]`, String(d).trim()));
+    child.stdout.on("data", (d) => {
+      this.buf += String(d);
+      let nl;
+      while ((nl = this.buf.indexOf("\n")) >= 0) {
+        const line = this.buf.slice(0, nl).trim();
+        this.buf = this.buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          const key = JSON.stringify(msg.id);
+          if (msg.id !== void 0 && msg.method === void 0 && this.waiting.has(key)) {
+            this.waiting.get(key)(msg);
+            this.waiting.delete(key);
+          }
+        } catch {
+          log(`[mcp ${this.name}] non-JSON output:`, line.slice(0, 200));
+        }
+      }
+    });
+    child.on("exit", (code) => {
+      log(`[mcp ${this.name}] exited`, code);
+      for (const [, w] of this.waiting) w({ jsonrpc: "2.0", id: null, error: { code: -32e3, message: "MCP server exited" } });
+      this.waiting.clear();
+    });
+    this.child = child;
+    log(`[mcp ${this.name}] started: ${this.spec.command} ${(this.spec.args ?? []).join(" ")}`);
+    return child;
+  }
+  async handle(method, bodyText) {
+    if (method === "GET") return new Response(null, { status: 405, headers: { allow: "POST, DELETE" } });
+    if (method === "DELETE") return new Response(null, { status: 200 });
+    if (method !== "POST") return new Response(null, { status: 405 });
+    let parsed;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch {
+      return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, { status: 400 });
+    }
+    const msgs = Array.isArray(parsed) ? parsed : [parsed];
+    const child = this.ensure();
+    const answers = msgs.filter((m) => m.method !== void 0 && m.id !== void 0).map(
+      (m) => new Promise((resolve) => {
+        const key = JSON.stringify(m.id);
+        const t = setTimeout(() => {
+          this.waiting.delete(key);
+          resolve({ jsonrpc: "2.0", id: m.id, error: { code: -32001, message: "MCP server timed out" } });
+        }, 12e4);
+        this.waiting.set(key, (msg) => (clearTimeout(t), resolve(msg)));
+      })
+    );
+    for (const m of msgs) child.stdin.write(JSON.stringify(m) + "\n");
+    if (answers.length === 0) return new Response(null, { status: 202 });
+    const out = await Promise.all(answers);
+    return Response.json(Array.isArray(parsed) ? out : out[0]);
+  }
+};
+var Device = class {
+  constructor(gw, servers) {
+    this.gw = gw;
+    this.servers = servers;
+    for (const [name, spec] of Object.entries(servers)) if ("command" in spec) this.stdio.set(name, new StdioMcp(name, spec));
+  }
+  gw;
+  servers;
+  conn = null;
+  reqs = /* @__PURE__ */ new Map();
+  stdio = /* @__PURE__ */ new Map();
+  async run() {
+    let delay = 1e3;
+    for (; ; ) {
+      try {
+        const conn = await this.gw.connect(await this.gw.authenticate());
+        this.conn = conn;
+        delay = 1e3;
+        log(`connected to gateway as device ${this.gw.key.id}; serving MCP: ${Object.keys(this.servers).join(", ") || "(none)"}`);
+        conn.onUnmatched = (f) => this.onFrame(f);
+        const keepalive = setInterval(() => conn.ws.readyState === WebSocket.OPEN && conn.ws.send("ping"), 3e4);
+        const closed = await conn.closed;
+        clearInterval(keepalive);
+        log("gateway connection closed", closed.code, closed.reason);
+        if (closed.code === 4003) throw new Error("this device was revoked by the phone");
+      } catch (e) {
+        log("gateway connection failed:", e instanceof Error ? e.message : e);
+        if (e instanceof Error && /revoked/.test(e.message)) process.exit(2);
+      }
+      this.conn = null;
+      this.reqs.clear();
+      await sleep(delay * (0.5 + Math.random() / 2));
+      delay = Math.min(delay * 2, 3e4);
+    }
+  }
+  send(f) {
+    const c = this.conn;
+    if (c && c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(f));
+  }
+  onFrame(f) {
+    if (f.t !== "tun") return;
+    const sid = String(f.sid);
+    if (f.op === "http.req") this.reqs.set(sid, { method: String(f.method), path: String(f.path), headers: f.headers ?? [], body: [] });
+    else if (f.op === "http.reqbody") this.reqs.get(sid)?.body.push(fromB64u(String(f.data)));
+    else if (f.op === "http.reqend") {
+      const req = this.reqs.get(sid);
+      this.reqs.delete(sid);
+      if (req) this.serve(sid, req).catch((e) => this.send({ t: "tun", op: "http.error", sid, message: String(e?.message ?? e) }));
+    }
+  }
+  async serve(sid, req) {
+    const m = /^\/mcp\/([A-Za-z0-9_-]{1,32})(\/.*)?$/.exec(req.path.split("?")[0]);
+    const spec = m ? this.servers[m[1]] : void 0;
+    let res;
+    if (!m || !spec) res = Response.json({ error: "unknown_server", servers: Object.keys(this.servers) }, { status: 404 });
+    else if ("url" in spec) {
+      const headers = new Headers();
+      for (const [k, v] of req.headers) if (!/^(host|origin|cookie)$/i.test(k)) headers.append(k, v);
+      res = await fetch(spec.url + (m[2] ?? ""), { method: req.method, headers, body: req.body.length ? Buffer.concat(req.body) : void 0 });
+    } else res = await this.stdio.get(m[1]).handle(req.method, Buffer.concat(req.body).toString("utf8"));
+    await streamBack((f) => this.send(f), sid, res);
+  }
+};
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 async function main() {
-  const i = process.argv.indexOf("--config");
-  if (i < 0) throw new Error("usage: ash-link --config <file>");
-  const cfg = JSON.parse(readFileSync(process.argv[i + 1], "utf8"));
+  const arg = (flag) => {
+    const i = process.argv.indexOf(flag);
+    return i >= 0 ? process.argv[i + 1] : void 0;
+  };
+  const cfgPath = arg("--config");
+  if (!cfgPath) throw new Error("usage: ash-link --config <file> [--pair <code>]");
+  const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
   mkdirSync(cfg.stateDir, { recursive: true, mode: 448 });
   const key = await loadOrCreateKey(cfg.stateDir);
   const gw = new GatewayClient(cfg.gateway, key);
   const fingerprint = await shortFingerprint(key.publicKey);
+  if (cfg.role === "client") {
+    const pairedFile = join(cfg.stateDir, "paired.json");
+    if (!existsSync(pairedFile)) {
+      const code = arg("--pair");
+      if (!code) throw new Error("not paired yet: run once with --pair <code from the phone>");
+      const pr = await gw.requestPairing(code, cfg.name ?? "laptop");
+      log(`pairing requested. Confirm on the phone: this device ${fingerprint}, phone ${pr.owner_fingerprint}`);
+      const grant = await gw.waitForApproval(pr.request_id, pr.owner_key, 10 * 6e4);
+      writeFileSync(pairedFile, JSON.stringify({ owner_key: pr.owner_key, owner_id: pr.owner_id, ...grant }), { mode: 384 });
+      log("paired with permissions", grant.permissions.join(", "));
+      if (!grant.permissions.includes("expose_capability")) log("note: the phone did not grant expose_capability, so it cannot call this device's tools");
+    }
+    await new Device(gw, cfg.mcp ?? {}).run();
+    return;
+  }
   for (; ; ) {
     try {
       const h = await gw.health();
@@ -741,6 +974,7 @@ async function main() {
   }
   const owner = new Owner(gw, new Engine(cfg.engine));
   serveControl(owner, cfg.control?.port ?? 3095, controlToken(cfg.stateDir), fingerprint);
+  serveMcpProxy(owner, cfg.mcpProxy?.port ?? 3096, secretToken(cfg.stateDir, "mcp-token"));
   await owner.run();
 }
 main().catch((e) => {
