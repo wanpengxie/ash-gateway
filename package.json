@@ -31,9 +31,6 @@
     "bindings": {
       "BOOTSTRAP_SECRET": {
         "description": "One-time claim secret. Use the value your ash phone shows (or `openssl rand -base64 32`) and enter the same value in the app."
-      },
-      "RESET_EPOCH": {
-        "description": "Change to wipe the gateway (e.g. after losing the phone). Leave 0."
       }
     }
   }

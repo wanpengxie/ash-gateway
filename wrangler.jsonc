@@ -8,10 +8,9 @@
     "bindings": [{ "name": "HUB", "class_name": "GatewayHub" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GatewayHub"] }],
-  "vars": {
-    // Change this value (from your own Cloudflare account) to wipe the gateway,
-    // e.g. after losing the Agent phone. A public request can never do this.
-    "RESET_EPOCH": "0"
-  },
+  // RESET_EPOCH is deliberately not declared here: set it in the Cloudflare dashboard
+  // (Settings → Variables) only when you want to wipe the gateway, e.g. after losing
+  // the phone. keep_vars stops later deploys (including Git builds) from resetting it.
+  "keep_vars": true,
   "observability": { "enabled": true }
 }
