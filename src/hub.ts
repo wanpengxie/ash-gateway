@@ -33,7 +33,7 @@ import {
 } from "./protocol";
 import { webLoginPage } from "./webui";
 
-export const GATEWAY_VERSION = "0.4.0";
+export const GATEWAY_VERSION = "0.4.1";
 
 interface Attachment {
   kind?: "device";
@@ -41,6 +41,8 @@ interface Attachment {
   role: Role;
   /** Origin the device connected through; owner signatures made on this socket are bound to it. */
   origin: string;
+  /** When the socket was accepted (liveness before its first keepalive). */
+  since?: number;
 }
 
 /** A browser WebSocket that the gateway tunnels to the phone. */
@@ -234,7 +236,7 @@ export class GatewayHub extends DurableObject<Env> {
       version: GATEWAY_VERSION,
       claimed: owner !== null,
       owner_id: owner?.id ?? null,
-      owner_online: owner !== null && this.ctx.getWebSockets(`dev:${owner.id}`).length > 0,
+      owner_online: this.ownerSocket(owner) !== undefined,
       bootstrap_configured: Boolean(this.env.BOOTSTRAP_SECRET),
     });
   }
@@ -381,7 +383,7 @@ export class GatewayHub extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     this.ctx.acceptWebSocket(server, [`dev:${dev.id}`, `role:${dev.role}`]);
-    server.serializeAttachment({ id: dev.id, role: dev.role, origin } satisfies Attachment);
+    server.serializeAttachment({ id: dev.id, role: dev.role, origin, since: Date.now() } satisfies Attachment);
     const owner = this.owner();
     server.send(
       JSON.stringify({
@@ -390,7 +392,7 @@ export class GatewayHub extends DurableObject<Env> {
         device_id: dev.id,
         role: dev.role,
         owner_id: owner?.id ?? null,
-        owner_online: dev.role === "owner" || (owner !== null && this.ctx.getWebSockets(`dev:${owner.id}`).length > 0),
+        owner_online: dev.role === "owner" || this.ownerSocket(owner) !== undefined,
       }),
     );
     if (dev.role === "owner") this.broadcastPresence(true);
@@ -519,7 +521,7 @@ export class GatewayHub extends DurableObject<Env> {
         t: "gw",
         op: "presence",
         ref,
-        owner_online: owner !== null && this.ctx.getWebSockets(`dev:${owner.id}`).length > 0,
+        owner_online: this.ownerSocket(owner) !== undefined,
         ...(me.role === "owner" ? { clients_online: this.onlineClients() } : {}),
       });
     }
@@ -635,7 +637,7 @@ export class GatewayHub extends DurableObject<Env> {
     }
     if (!hasPermission(dev, "web_ui")) return webLoginPage(403);
     const owner = this.owner();
-    const phone = owner ? this.ctx.getWebSockets(`dev:${owner.id}`)[0] : undefined;
+    const phone = this.ownerSocket(owner);
     if (!owner || !phone) return webLoginPage(503);
 
     const path = url.pathname + url.search;
@@ -830,6 +832,27 @@ export class GatewayHub extends DurableObject<Env> {
     if (!r) throw new ProtocolError("unknown_request", "unknown or expired pairing request");
     if (r.status !== "pending") throw new ProtocolError("not_pending", `request is ${r.status}`);
     return r;
+  }
+
+  /**
+   * The phone's live socket. Devices send "ping" every 30 s and the runtime answers "pong" without
+   * waking this object; that answer's timestamp is the heartbeat. A socket silent for 90 s is
+   * half-open (the phone lost its network without a close): it is closed here, so browsers are
+   * told the phone is offline instead of waiting for a tunnel that never answers.
+   */
+  private ownerSocket(owner: DeviceRow | null = this.owner()): WebSocket | undefined {
+    if (!owner) return undefined;
+    const now = Date.now();
+    for (const ws of this.ctx.getWebSockets(`dev:${owner.id}`)) {
+      const beat = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? (ws.deserializeAttachment() as Attachment | null)?.since ?? now;
+      if (now - beat <= LIMITS.heartbeatTimeoutMs) return ws;
+      try {
+        ws.close(4008, "no heartbeat");
+      } catch {
+        // already closing
+      }
+    }
+    return undefined;
   }
 
   private onlineClients(): string[] {

@@ -36,6 +36,8 @@ export const LIMITS = {
   webMaxBodyBytes: 8 * 1024 * 1024,
   /** Raw bytes per tunnel data frame (base64 keeps each frame well under the 1 MiB WebSocket cap). */
   tunnelChunkBytes: 256 * 1024,
+  /** A device socket without a keepalive for this long is treated as gone (devices ping every 30 s). */
+  heartbeatTimeoutMs: 90_000,
   /** How long the gateway waits for the phone to start answering a tunneled request. */
   tunnelHeadTimeoutMs: 30_000,
 } as const;
