@@ -17,6 +17,8 @@ import {
   verifySignature,
 } from "../src/protocol";
 import type { Bytes } from "../src/protocol";
+import { DeviceStream } from "./stream";
+export { DeviceStream } from "./stream";
 
 /** A device identity: one P-256 key pair. The private key never leaves this object. */
 export class DeviceKey {
@@ -214,6 +216,8 @@ export class GatewayClient {
 
 /** A WebSocket with a frame queue, so tests can await "the next frame matching X". */
 export class Connection {
+  private readonly streams = new Map<string, DeviceStream>();
+  private streamHandler: ((stream: DeviceStream) => void) | null = null;
   readonly opened: Promise<void>;
   readonly closed: Promise<{ code: number; reason: string }>;
   private readonly frames: Record<string, unknown>[] = [];
@@ -228,7 +232,11 @@ export class Connection {
       ws.addEventListener("error", () => reject(new GatewayError(0, "ws_error", "websocket failed to open")), { once: true });
     });
     this.closed = new Promise((resolve) => {
-      ws.addEventListener("close", (ev) => resolve({ code: ev.code, reason: ev.reason }), { once: true });
+      ws.addEventListener("close", (ev) => {
+        const result = { code: ev.code, reason: ev.reason };
+        for (const stream of this.streams.values()) stream.finish(result);
+        resolve(result);
+      }, { once: true });
     });
     ws.addEventListener("message", (ev) => {
       const text = String(ev.data);
@@ -239,6 +247,16 @@ export class Connection {
       } catch {
         return;
       }
+      if (frame.t === "tun" && typeof frame.sid === "string") {
+        if (frame.op === "ws.open" && frame.path === "/ash/device/stream" && this.streamHandler) {
+          const stream = this.makeStream(frame.sid, String(frame.from), String(frame.path), false);
+          this.streamHandler(stream);
+          this.send({ t: "tun", op: "ws.opened", sid: frame.sid });
+          return;
+        }
+        const stream = this.streams.get(frame.sid);
+        if (stream) { stream.accept(frame); return; }
+      }
       const i = this.waiters.findIndex((w) => w.pred(frame));
       if (i >= 0) this.waiters.splice(i, 1)[0].resolve(frame);
       else if (this.onUnmatched) this.onUnmatched(frame);
@@ -248,6 +266,22 @@ export class Connection {
 
   send(frame: unknown): void {
     this.ws.send(typeof frame === "string" ? frame : JSON.stringify(frame));
+  }
+
+  onStream(handler: (stream: DeviceStream) => void): () => void {
+    this.streamHandler = handler;
+    return () => { if (this.streamHandler === handler) this.streamHandler = null; };
+  }
+  openStream(to: string, path = "/ash/device/stream"): DeviceStream {
+    const sid = `o-${randomToken(16)}`;
+    const stream = this.makeStream(sid, to, path, true);
+    this.send({ t: "tun", op: "ws.open", sid, to, path });
+    return stream;
+  }
+  private makeStream(sid: string, peer: string, path: string, outgoing: boolean): DeviceStream {
+    const stream = new DeviceStream(sid, peer, path, f => this.send({ ...f, ...(outgoing ? { to: peer } : {}) }), () => this.streams.delete(sid));
+    this.streams.set(sid, stream);
+    return stream;
   }
 
   next(pred: (f: Record<string, unknown>) => boolean, timeoutMs = 10_000): Promise<Record<string, unknown>> {

@@ -12,6 +12,7 @@ import { b64u, fromB64u, LIMITS } from "../src/protocol";
 
 const BASE = (process.env.GATEWAY_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 const SECRET = process.env.BOOTSTRAP_SECRET ?? "";
+if (!["127.0.0.1", "localhost", "[::1]"].includes(new URL(BASE).hostname)) throw new Error("This test only runs against a local gateway");
 const BIG = randomBytes(1024 * 1024 + 123); // forces several tunnel chunks
 
 let passed = 0;
@@ -206,6 +207,19 @@ ok((await fetch(`${BASE}/api/echo`, { method: "POST", body: "{}" })).status === 
 
 console.log("laptop");
 const laptop = await startLaptop(await phoneGw.createPairTicket(phone), ["chat", "expose_capability"]);
+laptop.conn.onStream(s => s.onMessage(m => s.send(typeof m === "string" ? `echo:${m}` : m)));
+const duplex = phone.openStream(laptop.key.id);
+const streamReplies: (string | Uint8Array)[] = [];
+duplex.onMessage(m => streamReplies.push(m));
+const largeText = "你好🚀".repeat(60_000);
+duplex.send(largeText);
+ok(await until(() => streamReplies.length > 0) && streamReplies[0] === `echo:${largeText}`, "device duplex stream reassembles large Unicode messages");
+let replaced = false;
+duplex.onClose(r => { replaced = r.code === 4409; });
+const replacement = phone.openStream(laptop.key.id);
+ok(await until(() => replaced), "new device stream closes the previous stream");
+let peerGone = false;
+replacement.onClose(r => { peerGone = r.code === 4410; });
 ok(await until(() => presence.some((p) => p.device_id === laptop.key.id && p.online)), "the phone is told when its laptop comes online (device.presence)");
 const manifest = await phoneRequest(laptop.key.id, "GET", "/ash/manifest");
 ok(manifest.status === 200 && JSON.parse(manifest.body).capabilities[0].name === "fake.echo", "the phone reads the laptop's capability manifest through the gateway");
@@ -216,6 +230,7 @@ await phoneRequest(chatOnly.key.id, "GET", "/ash/manifest").then(
   () => ok(true, "devices without expose_capability receive no tunnel traffic"),
 );
 laptop.conn.close();
+ok(await until(() => peerGone), "device disconnect closes its stream at the phone");
 ok(await until(() => presence.some((p) => p.device_id === laptop.key.id && !p.online)), "the phone is told when its laptop goes away");
 await phoneRequest(laptop.key.id, "GET", "/ash/manifest").then(
   () => ok(false, "a laptop that went away reports device_offline"),

@@ -239,3 +239,28 @@ with `from`). ash core uses `GET /ash/manifest` (capabilities) and `POST /ash/ca
 (`{capability, args, caller}` → `{ok, content, data?, error?}`).
 
 The device side is ash core ([github.com/wanpengxie/ash](https://github.com/wanpengxie/ash)).
+
+### Phone ↔ device duplex stream (gateway 0.5)
+
+The owner sends `tun/ws.open {to, sid, path:"/ash/device/stream"}`. The sid is `o-`
+plus at least 20 base64url characters (clients generate 16 random bytes). The gateway
+requires an online, unrevoked device with `expose_capability`, registers the route in
+SQLite, and forwards the frame with authenticated `from`. No payload is persisted.
+Each device has one stream; opening another closes the previous stream at both ends
+with code 4409. A new connection for the same identity also replaces the old one.
+
+Both ends exchange `ws.msg {sid,text|b64,more?}` and `ws.close {sid,code,reason}`;
+owner frames include `to`, device frames do not. Devices may acknowledge with
+`ws.opened`. Unknown or mismatched device sids are rejected (4403); offline/forbidden
+opens close with 4404. Disconnect closes routes with 4410; revocation uses 4003.
+Each fragment is at most 256 KiB UTF-8. The client library reassembles messages up to
+4 MiB and refuses oversized input. Application replay and execution IDs are separate
+from these transport sids; this layer never retries an action.
+
+HTTP device replies are also checked against owner-created routes (3 minute TTL).
+Only response frames on the matching device/sid are accepted. Completion, error,
+abort and disconnect remove the route. Existing browser-to-phone tunnels are unchanged.
+
+Client API: `connection.openStream(deviceId)` and `connection.onStream(handler)`;
+streams expose `send`, `onMessage`, `onClose`, and `close`. Outer connection closure
+closes all its streams. Callers open a fresh stream after reconnecting.

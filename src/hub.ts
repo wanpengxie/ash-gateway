@@ -32,10 +32,12 @@ import {
   verifySignature,
 } from "./protocol";
 import { webLoginPage } from "./webui";
+import { DeviceTunnels } from "./device-tunnels";
 
-export const GATEWAY_VERSION = "0.4.1";
+export const GATEWAY_VERSION = "0.5.0";
 
 interface Attachment {
+  retired?: boolean;
   kind?: "device";
   id: string;
   role: Role;
@@ -91,6 +93,7 @@ interface PairRequestRow {
 
 export class GatewayHub extends DurableObject<Env> {
   private readonly sql: SqlStorage;
+  private readonly deviceTunnels: DeviceTunnels;
   private readonly pendingHttp = new Map<string, PendingHttp>();
   /** Partial ws.msg payloads (phone → browser) waiting for their last fragment. */
   private readonly wsParts = new Map<string, string[]>();
@@ -99,6 +102,8 @@ export class GatewayHub extends DurableObject<Env> {
     super(state, env);
     this.sql = state.storage.sql;
     this.migrate();
+    this.deviceTunnels = new DeviceTunnels(this.sql, f => this.sendToOwner(f), (id, f) => this.sendTo(id, f),
+      id => this.canExpose(id) && this.ctx.getWebSockets(`dev:${id}`).some(s => !(s.deserializeAttachment() as Attachment)?.retired));
     // Application-level keepalive answered by the runtime without waking the object.
     state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
@@ -108,6 +113,7 @@ export class GatewayHub extends DurableObject<Env> {
   private migrate(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS device_tunnels (sid TEXT PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY, role TEXT NOT NULL, pubkey TEXT NOT NULL, name TEXT NOT NULL,
         permissions TEXT NOT NULL, grant_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
@@ -128,7 +134,7 @@ export class GatewayHub extends DurableObject<Env> {
     const stored = this.meta("reset_epoch");
     if (stored !== null && stored !== epoch) {
       this.sql.exec(`DELETE FROM devices; DELETE FROM challenges; DELETE FROM sessions;
-        DELETE FROM pair_tickets; DELETE FROM pair_requests; DELETE FROM meta;`);
+        DELETE FROM pair_tickets; DELETE FROM pair_requests; DELETE FROM device_tunnels; DELETE FROM meta;`);
       for (const ws of this.ctx.getWebSockets()) ws.close(4010, "gateway reset");
     }
     this.setMeta("reset_epoch", epoch);
@@ -376,9 +382,11 @@ export class GatewayHub extends DurableObject<Env> {
     const dev = this.device(s.device_id);
     if (!dev || dev.revoked) throw new ProtocolError("unauthorized", "device revoked", 401);
 
-    if (dev.role === "owner") {
-      // One Agent phone: a new owner connection replaces the old one.
-      for (const old of this.ctx.getWebSockets(`dev:${dev.id}`)) old.close(4000, "replaced by a newer connection");
+    // One live connection per identity: never dispatch an action to two device processes.
+    this.deviceTunnels.disconnect(dev.role === "owner" ? undefined : dev.id, 4409, "connection replaced");
+    for (const old of this.ctx.getWebSockets(`dev:${dev.id}`)) {
+      old.serializeAttachment({ ...old.deserializeAttachment() as Attachment, retired: true });
+      old.close(4000, "replaced by a newer connection");
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
@@ -410,6 +418,7 @@ export class GatewayHub extends DurableObject<Env> {
     if (att?.kind === "tun") return this.tunnelFromBrowser(att, message);
     const me = att as Attachment | null;
     if (!me) return ws.close(4001, "no identity");
+    if (me.retired) return;
     if (typeof message !== "string") return this.reply(ws, { t: "gw", op: "error", code: "binary_not_supported" });
     // Tunnel data rides in ~350 KB frames (phone, and devices that expose tools); everyone
     // else stays at the relay limit.
@@ -435,7 +444,7 @@ export class GatewayHub extends DurableObject<Env> {
         } else {
           // A device that exposes tools answers the phone's tunnel requests; nothing else may tunnel.
           if (!this.canExpose(me.id)) throw new ProtocolError("forbidden", "device may not expose capabilities");
-          this.sendToOwner({ ...frame, from: me.id });
+          this.deviceTunnels.fromDevice(frame, me.id);
         }
       } else this.relay(ws, me, frame, message);
     } catch (e) {
@@ -458,13 +467,16 @@ export class GatewayHub extends DurableObject<Env> {
       return;
     }
     const me = att as Attachment | null;
+    if (me?.retired) return;
     if (me?.role === "owner" && this.ctx.getWebSockets(`dev:${me.id}`).filter((w) => w !== ws).length === 0) {
+      this.deviceTunnels.disconnect();
       this.broadcastPresence(false);
       // The phone is gone: every tunnel through it is gone too.
       for (const t of this.ctx.getWebSockets("tun")) t.close(4503, "agent phone disconnected");
       for (const [sid, p] of this.pendingHttp) this.failHttp(sid, p, 502, "agent phone disconnected");
     }
     if (me?.role === "client" && this.ctx.getWebSockets(`dev:${me.id}`).filter((w) => w !== ws).length === 0) {
+      this.deviceTunnels.disconnect(me.id);
       this.sendToOwner({ t: "gw", op: "device.presence", device_id: me.id, online: false });
     }
   }
@@ -596,6 +608,7 @@ export class GatewayHub extends DurableObject<Env> {
         this.sql.exec("UPDATE devices SET revoked = 1, grant_version = ? WHERE id = ?", grantVersion, clientId);
         this.sql.exec("DELETE FROM sessions WHERE device_id = ?", clientId);
         this.setMeta("grant_version", String(grantVersion));
+        this.deviceTunnels.disconnect(clientId, 4003, "revoked");
         for (const s of this.ctx.getWebSockets(`dev:${clientId}`)) s.close(4003, "revoked");
         return this.reply(ws, { t: "gw", op: "device.revoke.ok", ref, client_id: clientId });
       }
@@ -688,14 +701,7 @@ export class GatewayHub extends DurableObject<Env> {
    * Only devices granted `expose_capability` receive tunnel traffic.
    */
   private tunnelToDevice(ws: WebSocket, me: Attachment, f: Record<string, unknown>): void {
-    const to = String(f.to);
-    const sid = String(f.sid ?? "");
-    const fail = (message: string) => this.reply(ws, { t: "tun", op: "http.error", sid, from: to, message });
-    if (!this.canExpose(to)) return fail("device is not allowed to expose capabilities");
-    const sockets = this.ctx.getWebSockets(`dev:${to}`);
-    if (sockets.length === 0) return fail("device_offline");
-    const text = JSON.stringify({ ...f, from: me.id });
-    for (const s of sockets) s.send(text);
+    this.deviceTunnels.fromOwner(f, me.id);
   }
 
   /** Frames the phone sends back on a tunnel stream. */
@@ -877,7 +883,10 @@ export class GatewayHub extends DurableObject<Env> {
 
   private sendTo(deviceId: string, frame: Record<string, unknown>): void {
     const text = JSON.stringify(frame);
-    for (const ws of this.ctx.getWebSockets(`dev:${deviceId}`)) ws.send(text);
+    for (const ws of this.ctx.getWebSockets(`dev:${deviceId}`)) {
+      if ((ws.deserializeAttachment() as Attachment)?.retired) continue;
+      try { ws.send(text); } catch { /* Peer is already closing; still notify the other endpoint. */ }
+    }
   }
 
   private reply(ws: WebSocket, frame: Record<string, unknown>): void {
