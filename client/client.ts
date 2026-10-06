@@ -255,7 +255,10 @@ export class Connection {
           return;
         }
         const stream = this.streams.get(frame.sid);
-        if (stream) { stream.accept(frame); return; }
+        if (stream) {
+          if (frame.op !== "ws.msg" || frame.from === stream.peer) stream.accept(frame);
+          return;
+        }
       }
       const i = this.waiters.findIndex((w) => w.pred(frame));
       if (i >= 0) this.waiters.splice(i, 1)[0].resolve(frame);
