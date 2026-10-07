@@ -37,6 +37,14 @@
 
 **手机丢了怎么办**：在 Cloudflare 控制台 → 这个 Worker → Settings → Variables，添加或修改变量 `RESET_EPOCH`，填一个新值（比如 `1`，下次再重置就填 `2`），保存并部署。网关会清空全部设备和授权，等待重新认领。能做这件事的只有 Cloudflare 账户的持有者，任何公网请求都触发不了重置。仓库配置开启了 `keep_vars`，之后的部署不会把这个值改回去。
 
+### 自定义域名
+
+当前部署绑定了 `https://ash.onestudio.cc`，同时保留原来的 `workers.dev` 地址；两个入口连接的是同一个 Worker 和 GatewayHub，不会重新认领或清空设备。
+
+`wrangler.jsonc` 的 `routes` 保存了这项绑定。**部署到你自己的 Cloudflare 账户时，请把该域名改成你账户中已激活域名的子域名，或删除 `routes` 只使用 `workers.dev`。** Cloudflare 会为 Custom Domain 配置 DNS 和 HTTPS 证书；不要覆盖已被其他服务使用的子域名。
+
+绑定不会自动修改手机和笔记本的网关配置；要切换入口，需把它们的网关 URL 改为新地址。浏览器的密钥按 origin 存储，第一次访问新域名需要重新配对。域名切换后，原先缓存的 DNS 负响应可能要等缓存过期才会消失。
+
 ## 网页端
 
 配对时被授予 `web_ui` 权限的浏览器，直接打开网关地址 `https://ash-gateway.<子域>.workers.dev/`，就能用到手机上 **ash 的完整界面**（和手机 App 里的是同一个）。请求通过网关隧道到达手机上的 ash core，ash core 知道是哪台已配对设备在说话。

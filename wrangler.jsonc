@@ -6,6 +6,7 @@
   // request.signal aborts when the browser disconnects (ends tunneled event streams early).
   "compatibility_flags": ["enable_request_signal"],
   "workers_dev": true,
+  "routes": [{ "pattern": "ash.onestudio.cc", "custom_domain": true }],
   "durable_objects": {
     "bindings": [{ "name": "HUB", "class_name": "GatewayHub" }]
   },
