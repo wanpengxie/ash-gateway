@@ -41,6 +41,7 @@ one gateway from being replayed on another.
 | `auth` | origin, device_id, nonce | the device |
 | `pair-approve` | origin, request_id, client_id, client_key, permissions (sorted, comma-joined), grant_version (decimal) | owner |
 | `revoke` | origin, client_id, grant_version | owner |
+| `device-permissions` | origin, client_id, sorted permissions joined by comma, grant_version | owner |
 | `msg` | v, type, message_id, from, to, issued_at, expires_at, reply_to (empty if null), base64url(SHA-256(payload)) | envelope sender |
 
 ## HTTP
@@ -142,6 +143,7 @@ Answers carry `ref` = the request's `id`. Errors come back as
 | `pair.approve` | owner | request_id, permissions, grant_version, sig | `pair.approve.ok` |
 | `pair.reject` | owner | request_id | `pair.reject.ok` |
 | `device.revoke` | owner | client_id, grant_version, sig | `device.revoke.ok`; the client's sockets close with code 4003 |
+| `device.permissions` | owner | client_id, permissions, grant_version, sig | `device.permissions.ok`; replaces grants (empty is allowed), closes device streams and sockets with code 4001 so the paired device reconnects under its new permissions |
 | `device.list` | owner | — | `device.list.ok` {grant_version, devices} |
 | `delivered` | server → sender | message_id, to | the envelope was handed to the target's socket |
 

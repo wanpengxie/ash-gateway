@@ -109,7 +109,7 @@ async function main(): Promise<void> {
   // ---------------------------------------------------------------- relay
   console.log("relay");
   const clientSession = await laptop.authenticate();
-  const pc = await laptop.connect(clientSession);
+  let pc = await laptop.connect(clientSession);
   const chello = await pc.next((f) => f.op === "hello");
   ok(chello.role === "client" && chello.owner_online === true, "client sees the phone online");
 
@@ -149,6 +149,18 @@ async function main(): Promise<void> {
   ok((await pc.next((f) => f.op === "presence" && f.owner_online === true)).owner_online === true, "client is told the phone is back");
 
   // ---------------------------------------------------------------- revoke
+  console.log("permission changes");
+  await rejects(pc.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["web_ui"], grant_version: grant + 1, sig: "invalid" }), "forbidden", "clients cannot widen their own permissions");
+  await rejects(phone2.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["web_ui"], grant_version: grant + 1, sig: await owner.key.sign(new Uint8Array([1])) }), "bad_signature", "permission changes require owner signature");
+  await rejects(owner.permissions(phone2, laptop.key.id, [], grant), "stale_grant", "permission changes reject stale grant versions");
+  await owner.permissions(phone2, laptop.key.id, [], ++grant);
+  ok((await pc.closed).code === 4001, "permission changes disconnect the old client session without revoking pairing");
+  pc = await laptop.connect(await laptop.authenticate());
+  await pc.next(f => f.op === "hello");
+  const listChanged = await phone2.request({ op: "device.list" });
+  ok((listChanged.devices as any[]).find(d => d.id === laptop.key.id).permissions.length === 0, "all permissions can be withdrawn without deleting a device");
+  pc.send({ t: "tun", op: "http.head", sid: "removed-permission", status: 200, headers: [] });
+  ok((await pc.next(f => f.op === "error")).code === "forbidden", "reconnected client cannot expose capabilities without permission");
   console.log("revoke");
   await rejects(owner.revoke(phone2, laptop.key.id, grant), "stale_grant", "revocation must move the grant version forward");
   await owner.revoke(phone2, laptop.key.id, ++grant);

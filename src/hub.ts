@@ -595,6 +595,19 @@ export class GatewayHub extends DurableObject<Env> {
         this.sql.exec("UPDATE pair_requests SET status = 'rejected' WHERE id = ?", requestId);
         return this.reply(ws, { t: "gw", op: "pair.reject.ok", ref });
       }
+      case "device.permissions": {
+        const clientId = str(frame, "client_id"), permissions = perms(frame, true), grantVersion = num(frame, "grant_version");
+        if (!await verifySignature(dev.pubkey, str(frame, "sig"), signCtx.permissions(origin, clientId, permissions, grantVersion))) throw new ProtocolError("bad_signature", "permission signature does not verify");
+        const target = this.device(clientId);
+        if (!target || target.role !== "client" || target.revoked) throw new ProtocolError("unknown_device", "no active client");
+        if (grantVersion <= this.grantVersion()) throw new ProtocolError("stale_grant", "grant version is stale");
+        this.sql.exec("UPDATE devices SET permissions = ?, grant_version = ? WHERE id = ?", JSON.stringify([...permissions].sort()), grantVersion, clientId);
+        this.setMeta("grant_version", String(grantVersion));
+        this.deviceTunnels.disconnect(clientId, 4410, "permissions changed");
+        for (const socket of this.ctx.getWebSockets(`dev:${clientId}`)) socket.close(4001, "permissions changed");
+        this.sendToOwner({ t: "gw", op: "device.presence", device_id: clientId, online: false });
+        return this.reply(ws, { t: "gw", op: "device.permissions.ok", ref, client_id: clientId });
+      }
       case "device.revoke": {
         const clientId = str(frame, "client_id");
         const grantVersion = num(frame, "grant_version");
@@ -934,9 +947,9 @@ function optName(o: Record<string, unknown>): string | null {
   return v;
 }
 
-function perms(o: Record<string, unknown>): string[] {
+function perms(o: Record<string, unknown>, allowEmpty = false): string[] {
   const v = o.permissions;
-  if (!Array.isArray(v) || v.length === 0) throw new ProtocolError("bad_request", "permissions must be a non-empty array");
+  if (!Array.isArray(v) || (!allowEmpty && v.length === 0)) throw new ProtocolError("bad_request", "permissions must be a non-empty array");
   for (const p of v) {
     if (!(PERMISSIONS as readonly string[]).includes(p)) throw new ProtocolError("bad_permission", `unknown permission ${String(p)}`);
   }

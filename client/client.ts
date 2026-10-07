@@ -170,6 +170,10 @@ export class GatewayClient {
     const sig = await this.key.sign(ctx.revoke(this.origin, clientId, grantVersion));
     return conn.request({ op: "device.revoke", client_id: clientId, grant_version: grantVersion, sig });
   }
+  async permissions(conn: Connection, clientId: string, permissions: Permission[], grantVersion: number) {
+    const sig = await this.key.sign(ctx.permissions(this.origin, clientId, permissions, grantVersion));
+    return conn.request({ op: "device.permissions", client_id: clientId, permissions, grant_version: grantVersion, sig });
+  }
 
   // ---------------------------------------------------------------- envelopes
 

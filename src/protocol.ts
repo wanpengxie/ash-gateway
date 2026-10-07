@@ -88,6 +88,8 @@ export const ctx = {
     ]),
   revoke: (origin: string, clientId: string, grantVersion: number) =>
     signingInput("revoke", [origin, clientId, String(grantVersion)]),
+  permissions: (origin: string, clientId: string, permissions: readonly string[], grantVersion: number) =>
+    signingInput("device-permissions", [origin, clientId, [...permissions].sort().join(","), String(grantVersion)]),
 };
 
 /**
