@@ -3,6 +3,7 @@
 
 import type { Env } from "./env";
 import { json } from "./http";
+import { installPage } from "./install-page";
 import { GatewayHub } from "./hub";
 import { LIMITS } from "./protocol";
 import { ICON_SVG, WEB_MANIFEST } from "./static";
@@ -20,6 +21,10 @@ export default {
     // without cookies (install prompts, the pairing page), and they carry nothing private.
     if (request.method === "GET" && url.pathname === "/manifest.webmanifest") return staticAsset(WEB_MANIFEST, "application/manifest+json");
     if (request.method === "GET" && url.pathname === "/icon.svg") return staticAsset(ICON_SVG, "image/svg+xml");
+
+    // The install page for a computer being paired: public, stateless, never reaches the hub.
+    const install = request.method === "GET" ? /^\/p\/([^/]*)$/.exec(url.pathname) : null;
+    if (install) return installPage(url.origin, install[1], request.headers.get("user-agent") ?? "");
 
     // /v1/* is the gateway API; every other path is the phone's ash UI through the tunnel
     // (the hub answers with the pairing page until this browser is a paired device).
