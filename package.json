@@ -12,7 +12,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "e2e": "tsx scripts/e2e.ts",
     "hibernation": "tsx scripts/hibernation.ts",
-    "tunnel-e2e": "tsx scripts/tunnel-e2e.ts"
+    "tunnel-e2e": "tsx scripts/tunnel-e2e.ts",
+    "build:bundle": "tsx scripts/build-bundle.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260929.1",
