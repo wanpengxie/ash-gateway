@@ -85,13 +85,6 @@ test("device HTTP tunnels are gone: every http.* op is refused and nothing is re
   h.router.fromDevice({ op: "http.end", sid: "h" }, "pc");
   assert.equal(h.owner.length, seen); h.db.close();
 });
-test("leftover HTTP rows from an older version are dropped, not served", () => {
-  const h = setup();
-  h.db.prepare("INSERT INTO device_tunnels (sid,device,kind,expires) VALUES ('old','pc','http',?)").run(Date.now() + 100_000);
-  h.router.fromDevice({ op: "http.end", sid: "old" }, "pc");
-  assert.equal(h.owner.length, 0); assert.equal(h.device.at(-1)?.frame.op, "error");
-  assert.equal(h.db.prepare("SELECT count(*) AS n FROM device_tunnels").get()?.n, 0); h.db.close();
-});
 test("both ends relay link frames through the tunnel with gateway-stamped identities", () => {
   const h = setup(); h.open();
   // Fake kernel and fake device wired through the router.

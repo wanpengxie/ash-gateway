@@ -11,8 +11,6 @@ export class DeviceTunnels {
     sql.exec("CREATE TABLE IF NOT EXISTS device_tunnels (sid TEXT PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL, expires INTEGER NOT NULL)");
   }
   private row(sid: string): TunnelRow | undefined {
-    // Device HTTP tunnels no longer exist; drop any left over from an older version.
-    this.sql.exec("DELETE FROM device_tunnels WHERE kind <> 'ws'");
     return this.sql.exec<TunnelRow>("SELECT * FROM device_tunnels WHERE sid = ?", sid).toArray()[0];
   }
   private remove(sid: string): void { this.sql.exec("DELETE FROM device_tunnels WHERE sid = ?", sid); }
