@@ -11,6 +11,7 @@ import {
   type Envelope,
   envelopeSigningInput,
   hmacSha256,
+  LINK_PATH,
   type Permission,
   randomToken,
   sha256b64u,
@@ -252,7 +253,7 @@ export class Connection {
         return;
       }
       if (frame.t === "tun" && typeof frame.sid === "string") {
-        if (frame.op === "ws.open" && frame.path === "/ash/device/stream" && this.streamHandler) {
+        if (frame.op === "ws.open" && frame.path === LINK_PATH && this.streamHandler) {
           const stream = this.makeStream(frame.sid, String(frame.from), String(frame.path), false);
           this.streamHandler(stream);
           this.send({ t: "tun", op: "ws.opened", sid: frame.sid });
@@ -279,7 +280,7 @@ export class Connection {
     this.streamHandler = handler;
     return () => { if (this.streamHandler === handler) this.streamHandler = null; };
   }
-  openStream(to: string, path = "/ash/device/stream"): DeviceStream {
+  openStream(to: string, path = LINK_PATH): DeviceStream {
     const sid = `o-${randomToken(16)}`;
     const stream = this.makeStream(sid, to, path, true);
     this.send({ t: "tun", op: "ws.open", sid, to, path });

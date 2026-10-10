@@ -42,6 +42,9 @@ export const LIMITS = {
   tunnelHeadTimeoutMs: 30_000,
 } as const;
 
+/** The only path a tunnel to a device may carry: the `ash-link/1` WebSocket. */
+export const LINK_PATH = "/link";
+
 export const PERMISSIONS = [
   "chat",
   "read_status",

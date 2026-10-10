@@ -233,18 +233,9 @@ Rules:
 The owner receives `{t: "gw", op: "device.presence", device_id, online}` whenever a paired
 client connects or its last socket closes, so it can keep its member list live without polling.
 
-### Phone → device
+### Owner ↔ device `/link` stream
 
-The owner may open a stream to a paired client holding `expose_capability`: the same
-`http.*` frames with `to: <device id>`; the device answers on the same `sid` (frames arrive
-with `from`). ash core uses `GET /ash/manifest` (capabilities) and `POST /ash/call`
-(`{capability, args, caller}` → `{ok, content, data?, error?}`).
-
-The device side is ash core ([github.com/wanpengxie/ash](https://github.com/wanpengxie/ash)).
-
-### Phone ↔ device duplex stream (gateway 0.5)
-
-The owner sends `tun/ws.open {to, sid, path:"/ash/device/stream"}`. The sid is `o-`
+The owner sends `tun/ws.open {to, sid, path:"/link"}`. The sid is `o-`
 plus at least 20 base64url characters (clients generate 16 random bytes). The gateway
 requires an online, unrevoked device with `expose_capability`, registers the route in
 SQLite, and forwards the frame with authenticated `from`. No payload is persisted.
@@ -259,9 +250,14 @@ Each fragment is at most 256 KiB UTF-8. The client library reassembles messages 
 4 MiB and refuses oversized input. Application replay and execution IDs are separate
 from these transport sids; this layer never retries an action.
 
-HTTP device replies are also checked against owner-created routes (3 minute TTL).
-Only response frames on the matching device/sid are accepted. Completion, error,
-abort and disconnect remove the route. Existing browser-to-phone tunnels are unchanged.
+`/link` is the only path accepted: any other path is closed with 4404 `path_not_allowed`
+(including the former `/ash/device/stream`). Device HTTP tunnels (`http.*` with `to`) no
+longer exist and are refused with `http.error` `http_tunnel_removed`. Existing browser-to-phone
+tunnels are unchanged: the browser's WebSocket path is forwarded as is and the owner decides.
+The stream carries the `ash-link/1` handshake: the owner sends
+`challenge` first and the device answers `hello`. The gateway stamps `from` on every frame (the
+owner's id towards the device, the device's id towards the owner); that id is the identity
+the owner trusts, and the device's own `from` is overwritten.
 
 Client API: `connection.openStream(deviceId)` and `connection.onStream(handler)`;
 streams expose `send`, `onMessage`, `onClose`, and `close`. Outer connection closure

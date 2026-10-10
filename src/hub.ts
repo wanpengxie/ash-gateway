@@ -442,7 +442,7 @@ export class GatewayHub extends DurableObject<Env> {
           if (typeof frame.to === "string") this.tunnelToDevice(ws, me, frame);
           else this.tunnelFromOwner(frame);
         } else {
-          // A device that exposes tools answers the phone's tunnel requests; nothing else may tunnel.
+          // A device holding expose_capability answers the owner's /link tunnel; nothing else may tunnel.
           if (!this.canExpose(me.id)) throw new ProtocolError("forbidden", "device may not expose capabilities");
           this.deviceTunnels.fromDevice(frame, me.id);
         }
@@ -710,8 +710,8 @@ export class GatewayHub extends DurableObject<Env> {
   }
 
   /**
-   * The phone opens a stream to one of its devices (e.g. to call that laptop's MCP tools).
-   * Only devices granted `expose_capability` receive tunnel traffic.
+   * The owner opens an `ash-link/1` WebSocket stream (path "/link" only) to one of its devices.
+   * Only devices granted `expose_capability` receive tunnel traffic; see DeviceTunnels.
    */
   private tunnelToDevice(ws: WebSocket, me: Attachment, f: Record<string, unknown>): void {
     this.deviceTunnels.fromOwner(f, me.id);
