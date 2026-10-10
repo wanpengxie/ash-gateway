@@ -33,6 +33,7 @@ import {
 } from "./protocol";
 import { webLoginPage } from "./webui";
 import { DeviceTunnels } from "./device-tunnels";
+import { ensureSchema } from "./schema";
 import { pairPendingEntry, pairRequestFrame } from "./pairing";
 
 export const GATEWAY_VERSION = "0.5.0";
@@ -113,33 +114,11 @@ export class GatewayHub extends DurableObject<Env> {
   // ------------------------------------------------------------------ storage
 
   private migrate(): void {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS device_tunnels (sid TEXT PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS devices (
-        id TEXT PRIMARY KEY, role TEXT NOT NULL, pubkey TEXT NOT NULL, name TEXT NOT NULL,
-        permissions TEXT NOT NULL, grant_version INTEGER NOT NULL, created_at INTEGER NOT NULL,
-        revoked INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS challenges (
-        nonce TEXT PRIMARY KEY, purpose TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS sessions (
-        token_hash TEXT PRIMARY KEY, device_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS pair_tickets (
-        ticket_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS pair_requests (
-        id TEXT PRIMARY KEY, client_id TEXT NOT NULL, pubkey TEXT NOT NULL, name TEXT NOT NULL,
-        status TEXT NOT NULL, approval TEXT, expires_at INTEGER NOT NULL, ticket_hash TEXT NOT NULL DEFAULT '');
-    `);
     // Lost-phone reset: only someone who controls the Cloudflare account can change
     // RESET_EPOCH (a deployment variable); a public request can never wipe the gateway.
-    const epoch = this.env.RESET_EPOCH ?? "0";
-    const stored = this.meta("reset_epoch");
-    if (stored !== null && stored !== epoch) {
-      this.sql.exec(`DELETE FROM devices; DELETE FROM challenges; DELETE FROM sessions;
-        DELETE FROM pair_tickets; DELETE FROM pair_requests; DELETE FROM device_tunnels; DELETE FROM meta;`);
+    if (ensureSchema(this.sql, this.env.RESET_EPOCH ?? "0")) {
       for (const ws of this.ctx.getWebSockets()) ws.close(4010, "gateway reset");
     }
-    this.setMeta("reset_epoch", epoch);
   }
 
   private meta(key: string): string | null {

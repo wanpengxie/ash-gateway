@@ -60,3 +60,17 @@ test("the installer address comes from INSTALL_SCRIPT_URL, falling back to the d
   assert.ok((await installPage(origin, code, LINUX, "https://x.com/$(id)").text()).includes(DEFAULT_INSTALL_SCRIPT_URL));
   assert.equal(installCommand("linux", origin, code, custom), `curl -fsSL '${custom}' | sh -s -- '${origin}' '${code}'`);
 });
+
+test("local debugging origins are accepted over plain http, other http origins are not", () => {
+  assert.equal(installPage("http://127.0.0.1:8787", code, MAC).status, 200);
+  assert.equal(installPage("http://localhost:8787", code, MAC).status, 200);
+  assert.equal(installPage("http://relay.example.com", code, MAC).status, 404);
+  assert.equal(installPage("http://127.0.0.1.evil.com", code, MAC).status, 404);
+});
+
+test("a pairing code starting with '-' stays a positional argument of the installer", async () => {
+  const dashed = "-AbCd1234_-AbCd1234_-AbCd";
+  const cmd = installCommand("linux", origin, dashed)!;
+  assert.ok(cmd.includes(`-- '${origin}' '${dashed}'`), "after the -- separator");
+  assert.equal(installPage(origin, dashed, LINUX).status, 200);
+});

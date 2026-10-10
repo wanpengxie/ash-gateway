@@ -21,8 +21,8 @@ export function installScriptUrl(configured?: string): string {
 /** Pairing tickets are base64url; anything else is not a code and is never put into a command. */
 const CODE = /^[A-Za-z0-9_-]{8,128}$/;
 
-/** The gateway's own origin goes into a shell command: only plain host names are accepted. */
-const ORIGIN = /^(https:\/\/[A-Za-z0-9.-]+|http:\/\/localhost)(:\d+)?$/;
+/** The gateway's own origin goes into a shell command: only plain host names are accepted (plain http only for local debugging). */
+const ORIGIN = /^(https:\/\/[A-Za-z0-9.-]+|http:\/\/(?:localhost|127\.0\.0\.1))(:\d+)?$/;
 
 export type Os = "mac" | "linux" | "windows" | "other";
 
