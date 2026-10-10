@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { DeviceKey, GatewayClient, GatewayError } from "../client/client";
-import { type Envelope, randomToken } from "../src/protocol";
+import { type Envelope, randomToken, sha256b64u } from "../src/protocol";
 
 const BASE = (process.env.GATEWAY_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 const SECRET = process.env.BOOTSTRAP_SECRET ?? "";
@@ -96,6 +96,9 @@ async function main(): Promise<void> {
   await rejects(new GatewayClient(BASE, await DeviceKey.generate()).requestPairing(ticket, "second"), "ticket_used", "reusing a ticket");
   const note = await phone.next((f) => f.op === "pair.request");
   ok(note.client_id === laptop.key.id && note.name === "e2e laptop", "phone is notified of the pending device");
+  ok(note.ticket_hash === (await sha256b64u(ticket)), "the pairing request names its ticket by hash");
+  const pending = (await phone.request({ op: "pair.pending" })).requests as { request_id: string; ticket_hash: string }[];
+  ok(pending.some((r) => r.request_id === pr.request_id && r.ticket_hash === note.ticket_hash), "pair.pending carries the ticket hash too");
   await rejects(laptop.authenticate(), "unknown_device", "pending device cannot log in before approval");
   await rejects(
     phone.request({ op: "pair.approve", request_id: pr.request_id, permissions: ["chat"], grant_version: grant + 1, sig: await owner.key.sign(new Uint8Array([1])) }),

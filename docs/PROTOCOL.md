@@ -97,7 +97,8 @@ POST /v1/auth/session   {device_id, nonce, sig}       → {token, expires_at, de
    A ticket is single-use: a second use gets `409 ticket_used`, and an unknown or
    expired ticket gets `404 ticket_invalid`. The client must compare `owner_key`
    with the key it scanned from the QR code.
-3. The owner sees a `pair.request` frame and approves or rejects it.
+3. The owner sees a `pair.request` frame and approves or rejects it. `ticket_hash` (the same
+   base64url SHA-256 it registered) says which pairing the request belongs to.
 4. The client polls:
 
    ```
@@ -138,8 +139,8 @@ Answers carry `ref` = the request's `id`. Errors come back as
 | `presence` | any → server | — | `owner_online` (+ `clients_online` for the owner) |
 | `presence` | server → clients | owner_online | pushed when the phone connects or drops |
 | `pair.ticket` | owner | ticket_hash = base64url(SHA-256(ticket)), expires_at (≤ 5 min) | `pair.ticket.ok` |
-| `pair.request` | server → owner | request_id, client_id, name, pubkey, fingerprint | — |
-| `pair.pending` | owner | — | `pair.pending.ok` {requests} |
+| `pair.request` | server → owner | request_id, client_id, name, pubkey, fingerprint, ticket_hash | — |
+| `pair.pending` | owner | — | `pair.pending.ok` {requests: [{request_id, client_id, name, pubkey, ticket_hash}]} |
 | `pair.approve` | owner | request_id, permissions, grant_version, sig | `pair.approve.ok` |
 | `pair.reject` | owner | request_id | `pair.reject.ok` |
 | `device.revoke` | owner | client_id, grant_version, sig | `device.revoke.ok`; the client's sockets close with code 4003 |
@@ -262,3 +263,21 @@ the owner trusts, and the device's own `from` is overwritten.
 Client API: `connection.openStream(deviceId)` and `connection.onStream(handler)`;
 streams expose `send`, `onMessage`, `onClose`, and `close`. Outer connection closure
 closes all its streams. Callers open a fresh stream after reconnecting.
+
+## Install page `GET /p/<pairing code>`
+
+Public, stateless, `no-store`; it never reaches the hub and does not check the code. It shows the
+one-line install command for the visitor's system (from the User-Agent; the other systems are listed
+below it), with a copy button:
+`curl -fsSL <installer> | sh -s -- '<gateway origin>' '<code>'` for macOS and Linux. Windows is not
+supported by the computer program yet and says so. A code that is not 8-128 base64url characters
+gets a 404 page and is never placed in a command.
+
+## Single-file bundle
+
+`npm run build:bundle` writes `dist/ash-gateway.mjs` (one minified ES module: default `fetch`
+handler plus the `GatewayHub` Durable Object class; `cloudflare:workers` stays an import),
+`dist/ash-gateway.metadata.json` (the `metadata` part of the Cloudflare module-upload request:
+`main_module`, compatibility date and flags, the `HUB` Durable Object binding, migration `v1` with
+the SQLite class, `keep_bindings`) and `dist/ash-gateway.mjs.sha256`. The deployer adds the
+account-specific bindings itself, e.g. `BOOTSTRAP_SECRET` as `secret_text`. `dist/` is not committed.

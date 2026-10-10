@@ -33,6 +33,7 @@ import {
 } from "./protocol";
 import { webLoginPage } from "./webui";
 import { DeviceTunnels } from "./device-tunnels";
+import { pairPendingEntry, pairRequestFrame } from "./pairing";
 
 export const GATEWAY_VERSION = "0.5.0";
 
@@ -88,6 +89,7 @@ interface PairRequestRow {
   status: "pending" | "approved" | "rejected";
   approval: string | null;
   expires_at: number;
+  ticket_hash: string;
   [k: string]: SqlStorageValue;
 }
 
@@ -126,7 +128,7 @@ export class GatewayHub extends DurableObject<Env> {
         ticket_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS pair_requests (
         id TEXT PRIMARY KEY, client_id TEXT NOT NULL, pubkey TEXT NOT NULL, name TEXT NOT NULL,
-        status TEXT NOT NULL, approval TEXT, expires_at INTEGER NOT NULL);
+        status TEXT NOT NULL, approval TEXT, expires_at INTEGER NOT NULL, ticket_hash TEXT NOT NULL DEFAULT '');
     `);
     // Lost-phone reset: only someone who controls the Cloudflare account can change
     // RESET_EPOCH (a deployment variable); a public request can never wipe the gateway.
@@ -340,14 +342,15 @@ export class GatewayHub extends DurableObject<Env> {
     this.sql.exec("UPDATE pair_tickets SET used = 1 WHERE ticket_hash = ?", ticketHash);
     const requestId = randomToken(16);
     this.sql.exec(
-      "INSERT INTO pair_requests (id, client_id, pubkey, name, status, expires_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+      "INSERT INTO pair_requests (id, client_id, pubkey, name, status, expires_at, ticket_hash) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
       requestId,
       clientId,
       pubkey,
       name,
       now + LIMITS.pairRequestTtlMs,
+      ticketHash,
     );
-    this.sendTo(owner.id, { t: "gw", op: "pair.request", request_id: requestId, client_id: clientId, name, pubkey, fingerprint });
+    this.sendTo(owner.id, pairRequestFrame({ id: requestId, client_id: clientId, name, pubkey, ticket_hash: ticketHash }, fingerprint));
     return json(200, {
       request_id: requestId,
       client_id: clientId,
@@ -557,7 +560,7 @@ export class GatewayHub extends DurableObject<Env> {
           t: "gw",
           op: "pair.pending.ok",
           ref,
-          requests: rows.map((r) => ({ request_id: r.id, client_id: r.client_id, name: r.name, pubkey: r.pubkey })),
+          requests: rows.map(pairPendingEntry),
         });
       }
       case "pair.approve": {

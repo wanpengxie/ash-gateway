@@ -3,3 +3,4 @@ node_modules/
 .dev.vars
 *.log
 .e2e-owner.json
+dist/
