@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detectOs, installCommand, installPage, INSTALL_SCRIPT_URL } from "../src/install-page";
+import { DEFAULT_INSTALL_SCRIPT_URL, detectOs, installCommand, installPage, installScriptUrl } from "../src/install-page";
 
 const origin = "https://relay.example.workers.dev";
 const code = "AbCd1234_-AbCd1234_-AbCd";
@@ -19,7 +19,7 @@ test("operating system comes from the user agent", () => {
 
 test("the command is one line with the gateway and the code; Windows has none", () => {
   const cmd = installCommand("mac", origin, code)!;
-  assert.equal(cmd, `curl -fsSL ${INSTALL_SCRIPT_URL} | sh -s -- '${origin}' '${code}'`);
+  assert.equal(cmd, `curl -fsSL '${DEFAULT_INSTALL_SCRIPT_URL}' | sh -s -- '${origin}' '${code}'`);
   assert.ok(!cmd.includes("\n"));
   assert.equal(installCommand("linux", origin, code), cmd);
   assert.equal(installCommand("windows", origin, code), null);
@@ -46,4 +46,17 @@ test("anything that is not a plain code is refused and never reaches the page", 
     assert.ok(!(await res.text()).includes("rm -rf"), bad);
   }
   assert.equal(installPage("https://x'; id; '", code, MAC).status, 404);
+});
+
+test("the installer address comes from INSTALL_SCRIPT_URL, falling back to the default", async () => {
+  const custom = "https://downloads.example.com/ash/install.sh";
+  assert.equal(installScriptUrl(custom), custom);
+  assert.equal(installScriptUrl(`  ${custom}\n`), custom);
+  for (const bad of [undefined, "", "http://example.com/i.sh", "https://x.com/i.sh?a=1&b=2", "https://x.com/$(id)", "https://x.com/a b", "https://x.com/'; id; '", "javascript:alert(1)"])
+    assert.equal(installScriptUrl(bad), DEFAULT_INSTALL_SCRIPT_URL, String(bad));
+  const html = await installPage(origin, code, LINUX, custom).text();
+  assert.ok(html.includes(`curl -fsSL &#39;${custom}&#39; |`));
+  assert.ok(!html.includes(DEFAULT_INSTALL_SCRIPT_URL));
+  assert.ok((await installPage(origin, code, LINUX, "https://x.com/$(id)").text()).includes(DEFAULT_INSTALL_SCRIPT_URL));
+  assert.equal(installCommand("linux", origin, code, custom), `curl -fsSL '${custom}' | sh -s -- '${origin}' '${code}'`);
 });

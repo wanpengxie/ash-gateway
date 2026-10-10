@@ -11,6 +11,8 @@
     "bindings": [{ "name": "HUB", "class_name": "GatewayHub" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GatewayHub"] }],
+  // Where the /p/<code> install page sends a computer to fetch its installer. Override at deploy time.
+  "vars": { "INSTALL_SCRIPT_URL": "https://github.com/wanpengxie/ash/releases/download/device-v0.2.0/install.sh" },
   // RESET_EPOCH is deliberately not declared here: set it in the Cloudflare dashboard
   // (Settings → Variables) only when you want to wipe the gateway, e.g. after losing
   // the phone. keep_vars stops later deploys (including Git builds) from resetting it.

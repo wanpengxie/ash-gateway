@@ -269,7 +269,7 @@ closes all its streams. Callers open a fresh stream after reconnecting.
 Public, stateless, `no-store`; it never reaches the hub and does not check the code. It shows the
 one-line install command for the visitor's system (from the User-Agent; the other systems are listed
 below it), with a copy button:
-`curl -fsSL <installer> | sh -s -- '<gateway origin>' '<code>'` for macOS and Linux. Windows is not
+`curl -fsSL '<installer>' | sh -s -- '<gateway origin>' '<code>'` (`<installer>` is the gateway variable `INSTALL_SCRIPT_URL`: a plain https URL, else the built-in release address) for macOS and Linux. Windows is not
 supported by the computer program yet and says so. A code that is not 8-128 base64url characters
 gets a 404 page and is never placed in a command.
 
@@ -279,5 +279,5 @@ gets a 404 page and is never placed in a command.
 handler plus the `GatewayHub` Durable Object class; `cloudflare:workers` stays an import),
 `dist/ash-gateway.metadata.json` (the `metadata` part of the Cloudflare module-upload request:
 `main_module`, compatibility date and flags, the `HUB` Durable Object binding, migration `v1` with
-the SQLite class, `keep_bindings`) and `dist/ash-gateway.mjs.sha256`. The deployer adds the
+the SQLite class, a `plain_text` binding `INSTALL_SCRIPT_URL` with the default address, `keep_bindings`) and `dist/ash-gateway.mjs.sha256`. The deployer adds the
 account-specific bindings itself, e.g. `BOOTSTRAP_SECRET` as `secret_text`. `dist/` is not committed.

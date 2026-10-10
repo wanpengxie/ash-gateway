@@ -24,7 +24,7 @@ export default {
 
     // The install page for a computer being paired: public, stateless, never reaches the hub.
     const install = request.method === "GET" ? /^\/p\/([^/]*)$/.exec(url.pathname) : null;
-    if (install) return installPage(url.origin, install[1], request.headers.get("user-agent") ?? "");
+    if (install) return installPage(url.origin, install[1], request.headers.get("user-agent") ?? "", env.INSTALL_SCRIPT_URL);
 
     // /v1/* is the gateway API; every other path is the phone's ash UI through the tunnel
     // (the hub answers with the pairing page until this browser is a paired device).

@@ -2,8 +2,21 @@
 // that installs the computer program and pairs it. Public and stateless: it only echoes the code
 // from the URL into a command, never checks it, and is never cached.
 
-/** Where the computer program's release installer lives (the installer then downloads the matching build). */
-export const INSTALL_SCRIPT_URL = "https://github.com/wanpengxie/ash/releases/download/device-v0.2.0/install.sh";
+/**
+ * Where the computer program's release installer lives (the installer then downloads the matching
+ * build). The gateway's `INSTALL_SCRIPT_URL` variable overrides it; wrangler.jsonc and the bundle
+ * metadata carry the same default.
+ */
+export const DEFAULT_INSTALL_SCRIPT_URL = "https://github.com/wanpengxie/ash/releases/download/device-v0.2.0/install.sh";
+
+/** The URL goes into a shell command: plain https URLs only (no query, no shell characters). */
+const SCRIPT_URL = /^https:\/\/[A-Za-z0-9.-]+(:\d+)?(\/[A-Za-z0-9._~%+-]*)*$/;
+
+/** The configured installer URL, or the default when it is unset or not a plain https URL. */
+export function installScriptUrl(configured?: string): string {
+  const url = configured?.trim();
+  return url && SCRIPT_URL.test(url) ? url : DEFAULT_INSTALL_SCRIPT_URL;
+}
 
 /** Pairing tickets are base64url; anything else is not a code and is never put into a command. */
 const CODE = /^[A-Za-z0-9_-]{8,128}$/;
@@ -22,14 +35,14 @@ export function detectOs(userAgent: string): Os {
 }
 
 /** The one-line command for a system, or null when the computer program does not support it. */
-export function installCommand(os: Os, origin: string, code: string): string | null {
-  if (os === "mac" || os === "linux") return `curl -fsSL ${INSTALL_SCRIPT_URL} | sh -s -- '${origin}' '${code}'`;
+export function installCommand(os: Os, origin: string, code: string, scriptUrl = DEFAULT_INSTALL_SCRIPT_URL): string | null {
+  if (os === "mac" || os === "linux") return `curl -fsSL '${scriptUrl}' | sh -s -- '${origin}' '${code}'`;
   return null;
 }
 
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
-export function installPage(origin: string, code: string, userAgent: string): Response {
+export function installPage(origin: string, code: string, userAgent: string, scriptUrl?: string): Response {
   const headers = {
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
@@ -43,7 +56,7 @@ export function installPage(origin: string, code: string, userAgent: string): Re
   }
   const detected = detectOs(userAgent);
   const blocks = (["mac", "linux", "windows"] as const).map((os) => {
-    const cmd = installCommand(os, origin, code);
+    const cmd = installCommand(os, origin, code, installScriptUrl(scriptUrl));
     const title = os === "mac" ? "macOS" : os === "linux" ? "Linux" : "Windows";
     const body = cmd
       ? `<pre id="cmd-${os}">${esc(cmd)}</pre><button data-copy="cmd-${os}">复制</button>`
