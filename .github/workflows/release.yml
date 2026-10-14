@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:bundle
+      - name: Publish the deployable relay
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/ash-gateway.mjs dist/ash-gateway.metadata.json dist/ash-gateway.mjs.sha256 dist/wrangler.jsonc \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Deploy without the source: download these files into one folder, set \"name\" (and \"routes\" for your own domain) in wrangler.jsonc, then run npx wrangler deploy. Then set the claim secret: npx wrangler secret put BOOTSTRAP_SECRET."

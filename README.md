@@ -31,6 +31,7 @@
 1. **生成认领密钥**：先准备一个随机串，例如 `openssl rand -base64 32`。之后 ash App 会提供生成入口。
 2. **点上面的 Deploy to Cloudflare 按钮**，登录你自己的 Cloudflare 账户，填写 `BOOTSTRAP_SECRET`。按钮会从本仓库构建，自动创建 Worker 和 `GatewayHub` Durable Object。
    - 也可以手动部署：`npm ci && npx wrangler deploy && npx wrangler secret put BOOTSTRAP_SECRET`
+   - **不用源码，从 Release 部署**（ash 手机上的 agent 就这么做）：下载[最新 Release](https://github.com/wanpengxie/ash-gateway/releases/latest) 的 `ash-gateway.mjs` 和 `wrangler.jsonc` 到同一个目录，改 `wrangler.jsonc` 里的 `name`（用自己的域名就加上 `routes`），然后 `npx wrangler deploy && npx wrangler secret put BOOTSTRAP_SECRET`。Release 由打 `v*` tag 时的 GitHub Actions 构建。
 3. 打开 `https://ash-gateway.<子域>.workers.dev/v1/health`，看到 `"claimed": false, "bootstrap_configured": true` 就说明部署好了。
 4. **在 ash App 里填网关地址和同一个认领密钥**。手机用自己的硬件密钥完成首次认领（HMAC 证明知道密钥 + 签名证明持有私钥）。**认领只能成功一次**，之后可以在 Cloudflare 控制台删掉这个 Secret。
 5. **添加设备**：手机上生成配对二维码（网关地址 + 一次性票据 + 手机公钥指纹）→ 新设备提交配对申请 → 手机上确认设备指纹和权限 → 完成。

@@ -49,6 +49,22 @@ export async function buildBundle(outDir = join(root, "dist")): Promise<{ file: 
   });
   const metadata = join(outDir, "ash-gateway.metadata.json");
   writeFileSync(metadata, JSON.stringify(WORKER_METADATA, null, 2) + "\n");
+  // A deploy-ready config beside the module: `npx wrangler deploy` uploads it as built, with no source and no bundling.
+  // Set "name" (and add "routes" for your own domain) before deploying.
+  const deploy = {
+    name: "ash-gateway",
+    main: WORKER_METADATA.main_module,
+    no_bundle: true,
+    compatibility_date: WORKER_METADATA.compatibility_date,
+    compatibility_flags: [...WORKER_METADATA.compatibility_flags],
+    workers_dev: true,
+    durable_objects: { bindings: [{ name: "HUB", class_name: "GatewayHub" }] },
+    migrations: [{ tag: WORKER_METADATA.migrations.new_tag, new_sqlite_classes: [...WORKER_METADATA.migrations.new_sqlite_classes] }],
+    vars: { INSTALL_SCRIPT_URL: DEFAULT_INSTALL_SCRIPT_URL },
+    keep_vars: true,
+    observability: { enabled: true },
+  };
+  writeFileSync(join(outDir, "wrangler.jsonc"), JSON.stringify(deploy, null, 2) + "\n");
   const data = readFileSync(file);
   const sha256 = createHash("sha256").update(data).digest("hex");
   writeFileSync(join(outDir, "ash-gateway.mjs.sha256"), `${sha256}  ash-gateway.mjs\n`);
