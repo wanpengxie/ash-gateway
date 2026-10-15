@@ -1,4 +1,4 @@
-// Reference client for the ash gateway protocol (Node >= 22 and browsers).
+// Reference client for the ash gateway protocol (Node >= 22).
 //
 // Used by the end-to-end test both as the Agent phone (owner) and as a paired
 // client. The Android app implements the same steps natively; the byte-level
@@ -145,8 +145,7 @@ export class GatewayClient {
 
   async connect(session: Session): Promise<Connection> {
     const wsUrl = this.baseUrl.replace(/^http/, "ws").replace(/\/$/, "") + "/v1/ws";
-    // Browsers would rely on the HttpOnly cookie instead; Node's WebSocket cannot set
-    // headers, so the short-lived token rides in the subprotocol list.
+    // Node's WebSocket cannot set headers, so the short-lived token rides in the subprotocol list.
     const ws = new WebSocket(wsUrl, ["ash.v1", `ash.bearer.${session.token}`]);
     const conn = new Connection(ws);
     await conn.opened;

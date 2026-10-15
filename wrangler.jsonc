@@ -3,16 +3,12 @@
   "name": "ash-gateway",
   "main": "src/worker.ts",
   "compatibility_date": "2026-09-01",
-  // request.signal aborts when the browser disconnects (ends tunneled event streams early).
-  "compatibility_flags": ["enable_request_signal"],
   "workers_dev": true,
   "routes": [{ "pattern": "ash.onestudio.cc", "custom_domain": true }],
   "durable_objects": {
     "bindings": [{ "name": "HUB", "class_name": "GatewayHub" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GatewayHub"] }],
-  // Where the /p/<code> install page sends a computer to fetch its installer. Override at deploy time.
-  "vars": { "INSTALL_SCRIPT_URL": "https://github.com/wanpengxie/ash/releases/download/device-v0.2.0/install.sh" },
   // RESET_EPOCH is deliberately not declared here: set it in the Cloudflare dashboard
   // (Settings → Variables) only when you want to wipe the gateway, e.g. after losing
   // the phone. keep_vars stops later deploys (including Git builds) from resetting it.

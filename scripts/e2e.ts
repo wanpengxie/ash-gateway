@@ -76,6 +76,12 @@ async function main(): Promise<void> {
       body: JSON.stringify({ device_id: owner.key.id }),
     });
     ok(wrongOrigin.status === 403, "browser request from a foreign origin is refused");
+    ok(first.headers.get("set-cookie") === null, "a session is a Bearer token only: no cookie");
+  }
+  // The relay is a channel only: no page, no asset, no install page, nothing outside the API.
+  for (const path of ["/", "/p/abc", "/manifest.webmanifest", "/icon.svg", "/index.html", "/v1/web", "/api/send"]) {
+    const res = await fetch(`${BASE}${path}`, { headers: { accept: "text/html" } });
+    ok(res.status === 404 && !(res.headers.get("content-type") ?? "").includes("html"), `${path} is 404, no page`);
   }
   await expectWsRefused(`${BASE.replace(/^http/, "ws")}/v1/ws`, [], "websocket without a session is refused");
   await expectWsRefused(`${BASE.replace(/^http/, "ws")}/v1/ws`, ["ash.v1", `ash.bearer.${randomToken()}`], "websocket with a made-up session is refused");
@@ -153,8 +159,8 @@ async function main(): Promise<void> {
 
   // ---------------------------------------------------------------- revoke
   console.log("permission changes");
-  await rejects(pc.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["web_ui"], grant_version: grant + 1, sig: "invalid" }), "forbidden", "clients cannot widen their own permissions");
-  await rejects(phone2.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["web_ui"], grant_version: grant + 1, sig: await owner.key.sign(new Uint8Array([1])) }), "bad_signature", "permission changes require owner signature");
+  await rejects(pc.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["chat"], grant_version: grant + 1, sig: "invalid" }), "forbidden", "clients cannot widen their own permissions");
+  await rejects(phone2.request({ op: "device.permissions", client_id: laptop.key.id, permissions: ["chat"], grant_version: grant + 1, sig: await owner.key.sign(new Uint8Array([1])) }), "bad_signature", "permission changes require owner signature");
   await rejects(owner.permissions(phone2, laptop.key.id, [], grant), "stale_grant", "permission changes reject stale grant versions");
   await owner.permissions(phone2, laptop.key.id, [], ++grant);
   ok((await pc.closed).code === 4001, "permission changes disconnect the old client session without revoking pairing");

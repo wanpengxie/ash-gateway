@@ -30,19 +30,11 @@ export const LIMITS = {
   maxLiveChallenges: 256,
   maxDeviceNameLength: 64,
   maxClients: 32,
-  /** Browser sessions (devices holding `web_ui`) last a working day; everything else stays short. */
-  browserSessionTtlMs: 12 * 60 * 60_000,
-  /** Request body accepted for tunneled web requests (uploads go through here). */
-  webMaxBodyBytes: 8 * 1024 * 1024,
-  /** Raw bytes per tunnel data frame (base64 keeps each frame well under the 1 MiB WebSocket cap). */
-  tunnelChunkBytes: 256 * 1024,
   /** A device socket without a keepalive for this long is treated as gone (devices ping every 30 s). */
   heartbeatTimeoutMs: 90_000,
-  /** How long the gateway waits for the phone to start answering a tunneled request. */
-  tunnelHeadTimeoutMs: 30_000,
 } as const;
 
-/** The only path a tunnel to a device may carry: the `ash-link/1` WebSocket. */
+/** The only path a tunnel to a device may carry: the hub's link (which runs end-to-end encrypted inside it). */
 export const LINK_PATH = "/link";
 
 export const PERMISSIONS = [
@@ -50,9 +42,8 @@ export const PERMISSIONS = [
   "read_status",
   "cancel_own_task",
   "request_sensitive_action",
+  /** The owner may open a device tunnel (`tun`, path /link) to this device. */
   "expose_capability",
-  /** The full ash UI through the gateway tunnel — only for the owner's own devices. */
-  "web_ui",
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -135,17 +126,15 @@ export async function envelopeSigningInput(e: Omit<Envelope, "sig">): Promise<By
 export type ControlFrame = { t: "gw"; op: string; [k: string]: unknown };
 
 /**
- * Tunnel frames between the gateway and the phone (`t: "tun"`). The gateway opens a
- * stream id (`sid`) per browser HTTP request or WebSocket and the phone answers on it:
+ * Device tunnel frames (`t: "tun"`): the phone opens one stream to a device holding
+ * `expose_capability` and the gateway passes its messages on without reading them:
  *
- *   gateway → phone  http.req {sid, method, path, headers, from}  then  http.reqbody {sid, data}*  http.reqend {sid}
- *   phone → gateway  http.head {sid, status, headers}  http.body {sid, data}*  http.end {sid} | http.error {sid, message}
- *   gateway → phone  ws.open {sid, path, protocols, from}
- *   phone → gateway  ws.opened {sid, protocol} | ws.error {sid, message}
- *   both ways        ws.msg {sid, text | b64, more?}  ws.close {sid, code, reason}
+ *   phone → gateway   ws.open {to, sid, path: "/link"}   ws.msg {to, sid, text | b64, more?}   ws.close {to, sid, code, reason}
+ *   gateway → device  the same, with `from` (the phone) instead of `to`
+ *   device → gateway  ws.opened {sid}   ws.msg {sid, text | b64, more?}   ws.close {sid, code, reason}
+ *   gateway → phone   the same, with `from` (the device)
  *
- * Bodies and binary messages travel as base64 chunks of at most LIMITS.tunnelChunkBytes;
- * a ws.msg with `more: true` is continued by the next ws.msg on the same sid.
+ * One fragment is at most 256 KiB; a ws.msg with `more: true` is continued by the next one on the same sid.
  */
 export type TunnelFrame = { t: "tun"; op: string; sid: string; [k: string]: unknown };
 

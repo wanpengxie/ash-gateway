@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_INSTALL_SCRIPT_URL } from "../src/install-page";
 import { buildBundle, WORKER_METADATA } from "../scripts/build-bundle";
 
 test("the relay bundle is one module with the worker and Durable Object exports, matching wrangler.jsonc", async () => {
@@ -18,12 +17,9 @@ test("the relay bundle is one module with the worker and Durable Object exports,
   assert.equal(meta.main_module, "ash-gateway.mjs");
   const wrangler = JSON.parse(readFileSync(join(import.meta.dirname, "../wrangler.jsonc"), "utf8").split("\n").filter(l => !/^\s*\/\//.test(l)).join("\n"));
   assert.equal(meta.compatibility_date, wrangler.compatibility_date);
-  assert.deepEqual(meta.compatibility_flags, wrangler.compatibility_flags);
-  assert.deepEqual(meta.bindings, [
-    ...wrangler.durable_objects.bindings.map((b: { name: string; class_name: string }) => ({ type: "durable_object_namespace", ...b })),
-    ...Object.entries(wrangler.vars as Record<string, string>).map(([name, text]) => ({ type: "plain_text", name, text })),
-  ]);
-  assert.equal(wrangler.vars.INSTALL_SCRIPT_URL, DEFAULT_INSTALL_SCRIPT_URL);
+  assert.equal(meta.compatibility_flags, wrangler.compatibility_flags);
+  assert.deepEqual(meta.bindings, wrangler.durable_objects.bindings.map((b: { name: string; class_name: string }) => ({ type: "durable_object_namespace", ...b })));
+  assert.equal(wrangler.vars, undefined, "no variables: the relay serves no page that would need one");
   assert.deepEqual(meta.migrations, { new_tag: wrangler.migrations[0].tag, new_sqlite_classes: wrangler.migrations[0].new_sqlite_classes });
   assert.deepEqual(meta, JSON.parse(JSON.stringify(WORKER_METADATA)));
 });

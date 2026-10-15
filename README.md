@@ -6,7 +6,7 @@
 
 - **每人一套，部署在你自己的 Cloudflare 账户**。项目方不托管网关，也不经手你的消息、密钥或账户。
 - **手机和客户端都只发起出站 WSS**。不需要公网 IP、端口映射或 Tunnel，免费的 `workers.dev` 域名就够用。
-- **网关只做发现和转发**：保存设备公钥、授权和撤销记录；不保存对话、记忆、文件，也不排队离线任务。手机不在线时，发送方会明确收到 `device_offline`。
+- **网关只是通道**：只做认领、鉴权、配对登记、路由、在线状态和转发。手机和电脑之间的连接由两端自己端到端加密（TLS 1.3，互验公钥），网关只转发它读不懂、也改不了的数据。它**不提供任何页面或内容**：`/v1/` 以外的路径一律 404。不保存对话、记忆、文件，也不排队离线任务；手机不在线时，发送方会明确收到 `device_offline`。
 - **授权的根在手机上**：新设备必须经手机确认才能配对；每条消息都由发送方签名，由接收方验签。网关本身不是最终的授权者。
 
 > English: a self-hosted relay (one Worker + one SQLite-backed Durable Object with hibernatable WebSockets) between an ash agent phone and the user's other devices. It stores only public keys and grants — never conversations — and every state change is signed by the phone.
@@ -17,13 +17,13 @@
 你的 Cloudflare 账户
   https://ash-gateway.<你的子域>.workers.dev
                 │
-        Worker：路由、Origin 检查、请求体大小限制
+        Worker：只放行 /v1/*，Origin 检查、请求体大小限制
                 │
-        GatewayHub（1 个 SQLite DO）：认领、挑战/会话、配对、撤销、WSS 转发
+        GatewayHub（1 个 SQLite DO）：认领、挑战/会话、配对登记、撤销、路由、转发
                 │
       ┌─────────┴─────────┐
       │ WSS               │ WSS
- ash 手机（owner）      电脑 / 网页 / 其他手机（client）
+ ash 手机（owner）  ══ 端到端加密的 /link 通道 ══  电脑（client）
 ```
 
 ## 部署（首版：从 GitHub 部署，再手动接到 APK）
@@ -34,7 +34,7 @@
    - **不用源码，从 Release 部署**（ash 手机上的 agent 就这么做）：下载[最新 Release](https://github.com/wanpengxie/ash-gateway/releases/latest) 的 `ash-gateway.mjs` 和 `wrangler.jsonc` 到同一个目录，改 `wrangler.jsonc` 里的 `name`（用自己的域名就加上 `routes`），然后 `npx wrangler deploy && npx wrangler secret put BOOTSTRAP_SECRET`。Release 由打 `v*` tag 时的 GitHub Actions 构建。
 3. 打开 `https://ash-gateway.<子域>.workers.dev/v1/health`，看到 `"claimed": false, "bootstrap_configured": true` 就说明部署好了。
 4. **在 ash App 里填网关地址和同一个认领密钥**。手机用自己的硬件密钥完成首次认领（HMAC 证明知道密钥 + 签名证明持有私钥）。**认领只能成功一次**，之后可以在 Cloudflare 控制台删掉这个 Secret。
-5. **添加设备**：手机上生成配对二维码（网关地址 + 一次性票据 + 手机公钥指纹）→ 新设备提交配对申请 → 手机上确认设备指纹和权限 → 完成。
+5. **添加设备**：在 ash 里说「接一台电脑」。Ash 在聊天里给你一行安装命令：它从 [ash 的 GitHub 发布页](https://github.com/wanpengxie/ash/releases) 下载电脑程序并校验，带着一次性配对码和一次性密钥去配对。配对码经网关登记；密钥从不经过网关，电脑和手机第一次连接时用它互相证明，网关掉包任何一方的公钥都会被发现。
 
 **手机丢了怎么办**：在 Cloudflare 控制台 → 这个 Worker → Settings → Variables，添加或修改变量 `RESET_EPOCH`，填一个新值（比如 `1`，下次再重置就填 `2`），保存并部署。网关会清空全部设备和授权，等待重新认领。能做这件事的只有 Cloudflare 账户的持有者，任何公网请求都触发不了重置。仓库配置开启了 `keep_vars`，之后的部署不会把这个值改回去。
 
@@ -44,32 +44,16 @@
 
 `wrangler.jsonc` 的 `routes` 保存了这项绑定。**部署到你自己的 Cloudflare 账户时，请把该域名改成你账户中已激活域名的子域名，或删除 `routes` 只使用 `workers.dev`。** Cloudflare 会为 Custom Domain 配置 DNS 和 HTTPS 证书；不要覆盖已被其他服务使用的子域名。
 
-绑定不会自动修改手机和笔记本的网关配置；要切换入口，需把它们的网关 URL 改为新地址。浏览器的密钥按 origin 存储，第一次访问新域名需要重新配对。域名切换后，原先缓存的 DNS 负响应可能要等缓存过期才会消失。
-
-## 网页端
-
-配对时被授予 `web_ui` 权限的浏览器，直接打开网关地址 `https://ash-gateway.<子域>.workers.dev/`，就能用到手机上 **ash 的完整界面**（和手机 App 里的是同一个）。请求通过网关隧道到达手机上的 ash core，ash core 知道是哪台已配对设备在说话。
-
-- **第一次打开**：页面是配对页。在手机上生成配对码，粘贴进去，等手机确认。
-- **之后**：浏览器用本地保存的不可导出密钥自动签名登录。页面可以「添加到主屏幕」（`/manifest.webmanifest` 与图标公开、可缓存）。
-
-`web_ui` 等于你本人在用，只应批准给你自己的设备。远程浏览器可以聊天、看记录、确认操作，但配对、授权和密钥设置只能在手机上做。
+绑定不会自动修改手机和电脑的网关配置；要切换入口，需把它们的网关 URL 改为新地址。域名切换后，原先缓存的 DNS 负响应可能要等缓存过期才会消失。
 
 ## 设备端
 
 设备端程序是 [ash](https://github.com/wanpengxie/ash) 仓库里的 **ash core**（它吸收了早期的 ash-link）：
 
-- **手机（owner）**：ash App 里的 ash core 负责认领、配对审批（用手机 Keystore 里的密钥签名）、隧道（网页端）和调用笔记本的能力。
-- **笔记本（client）**：同一个 ash core 以 client 角色运行，把本机的 MCP 服务作为「设备能力」借给手机上的 Agent：
+- **手机（owner）**：ash App 里的中枢负责认领、配对审批（用手机 Keystore 里的密钥签名），并经 `/link` 通道连到每台电脑。
+- **电脑（client）**：ash 的电脑程序（`ash-device`），由 Ash 给的安装命令装好并配对，把本机能力借给手机上的 Agent。
 
-  ```json
-  { "role": "client", "gateway": "https://ash-gateway.<子域>.workers.dev", "stateDir": "~/.ash/laptop", "name": "MacBook",
-    "mcp": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ash-shared"] } } }
-  ```
-
-  在手机上生成配对码，然后在笔记本上执行 `node ash-core.mjs --config laptop.json --pair <配对码>`，在手机上批准并勾选「开放本机能力给 Agent」（`expose_capability`）。之后手机上的 Agent 直接多出 `macbook__files_*` 这样的工具，**不用改任何 DSH 配置**。
-
-笔记本能开放什么，完全由它自己的配置决定。没有 `expose_capability` 权限的设备收不到任何隧道流量。
+没有 `expose_capability` 权限的设备收不到任何隧道流量。
 
 ## 协议
 
@@ -81,7 +65,7 @@
 | `POST /v1/bootstrap/challenge` → `POST /v1/bootstrap/claim` | 手机首次认领（一次性） |
 | `POST /v1/auth/challenge` → `POST /v1/auth/session` | 已登记设备用签名换一个 15 分钟有效的会话 |
 | `GET /v1/ws` | 已鉴权的 WebSocket（先鉴权，后 Upgrade） |
-| `POST /v1/pair/request` / `POST /v1/pair/status` | 新设备凭二维码票据申请配对，并查询手机的批准结果 |
+| `POST /v1/pair/request` / `POST /v1/pair/status` | 新设备凭一次性配对码申请配对，并查询手机的批准结果 |
 
 ## 开发
 
@@ -93,7 +77,7 @@ npm run dev                     # wrangler dev，本地 http://127.0.0.1:8787
 GATEWAY_URL=http://127.0.0.1:8787 BOOTSTRAP_SECRET=... npm run e2e
 ```
 
-`npm run e2e` 会同时扮演手机和电脑，覆盖认领、重放、配对、签名转发、伪造发送方、离线和撤销；`npm run tunnel-e2e` 用手机和笔记本的测试替身测隧道：网页端（大文件、POST、事件流与中途断开、WebSocket）、设备上下线通知、手机调用笔记本的能力。它会用一把临时密钥认领网关，所以**不要对你真正要给手机用的网关跑**；要跑就用单独部署的测试实例，或者跑完后用 `RESET_EPOCH` 重置。
+`npm run e2e` 会同时扮演手机和电脑，覆盖认领、重放、配对、签名转发、伪造发送方、离线、撤销，以及「`/v1/` 以外一律 404」；`npm run tunnel-e2e` 用手机和电脑的测试替身测设备通道：`/link` 大消息往返、替换、只认 `/link`、无 `expose_capability` 不转发、上下线通知。它会用一把临时密钥认领网关，所以**不要对你真正要给手机用的网关跑**；要跑就用单独部署的测试实例，或者跑完后用 `RESET_EPOCH` 重置。
 
 ## 免费额度
 
@@ -106,7 +90,6 @@ GATEWAY_URL=http://127.0.0.1:8787 BOOTSTRAP_SECRET=... npm run e2e
 
 ## 当前不包含
 
-- **端到端加密**：V1 只有 TLS 加消息签名，Cloudflare 在转发时能看到明文。E2EE 是公开发布前的安全里程碑。
 - **手机直部署**：由 App 通过 OAuth 替你部署。
 - **Device Link**：电脑端注册能力，由手机反向调用。
 - **一个账户多台 Agent 手机**。

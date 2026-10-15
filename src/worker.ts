@@ -1,12 +1,13 @@
-// Public entry: routing, basic request hygiene, then hand everything to the
-// single GatewayHub Durable Object. The Worker keeps no state.
+// Public entry: routing, basic request hygiene, then hand the API to the single
+// GatewayHub Durable Object. The Worker keeps no state.
+//
+// The gateway is a channel only: it claims, authenticates, registers pairings, routes and
+// relays. It serves no page and no content; every path outside /v1/ is 404.
 
 import type { Env } from "./env";
 import { json } from "./http";
-import { installPage } from "./install-page";
 import { GatewayHub } from "./hub";
 import { LIMITS } from "./protocol";
-import { ICON_SVG, WEB_MANIFEST } from "./static";
 
 export { GatewayHub };
 
@@ -16,28 +17,16 @@ const INTERNAL_HEADERS = ["x-ash-origin"];
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (!url.pathname.startsWith("/v1/")) return json(404, { error: "not_found" });
 
-    // The web app manifest and its icon are public and cached at the edge: browsers fetch them
-    // without cookies (install prompts, the pairing page), and they carry nothing private.
-    if (request.method === "GET" && url.pathname === "/manifest.webmanifest") return staticAsset(WEB_MANIFEST, "application/manifest+json");
-    if (request.method === "GET" && url.pathname === "/icon.svg") return staticAsset(ICON_SVG, "image/svg+xml");
-
-    // The install page for a computer being paired: public, stateless, never reaches the hub.
-    const install = request.method === "GET" ? /^\/p\/([^/]*)$/.exec(url.pathname) : null;
-    if (install) return installPage(url.origin, install[1], request.headers.get("user-agent") ?? "", env.INSTALL_SCRIPT_URL);
-
-    // /v1/* is the gateway API; every other path is the phone's ash UI through the tunnel
-    // (the hub answers with the pairing page until this browser is a paired device).
-    const api = url.pathname.startsWith("/v1/");
-
-    // Browsers always send Origin on cross-site POST and WebSocket requests; native
-    // clients send none. A foreign Origin is refused before anything reaches the hub.
-    // This is a CSRF guard only — every state change is still signature-checked.
+    // Native clients send no Origin; a browser would, on cross-site POST and WebSocket requests.
+    // A foreign Origin is refused before anything reaches the hub. This is a CSRF guard only —
+    // every state change is still signature-checked.
     const origin = request.headers.get("origin");
     if (origin !== null && origin !== url.origin) return json(403, { error: "origin_not_allowed" });
 
     const length = Number(request.headers.get("content-length") ?? "0");
-    if (length > (api ? LIMITS.maxBodyBytes : LIMITS.webMaxBodyBytes)) return json(413, { error: "body_too_large" });
+    if (length > LIMITS.maxBodyBytes) return json(413, { error: "body_too_large" });
 
     const headers = new Headers(request.headers);
     for (const h of INTERNAL_HEADERS) headers.delete(h);
@@ -49,7 +38,3 @@ export default {
     return hub.fetch(new Request(request, { headers }));
   },
 } satisfies ExportedHandler<Env>;
-
-function staticAsset(body: string, type: string): Response {
-  return new Response(body, { headers: { "content-type": type, "cache-control": "public, max-age=86400, immutable" } });
-}

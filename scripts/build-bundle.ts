@@ -8,21 +8,17 @@
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { DEFAULT_INSTALL_SCRIPT_URL } from "../src/install-page";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** Keep in step with wrangler.jsonc (compatibility date and flags, the HUB binding, vars, migration v1). */
+/** Keep in step with wrangler.jsonc (compatibility date, the HUB binding, migration v1). */
 export const WORKER_METADATA = {
   main_module: "ash-gateway.mjs",
   compatibility_date: "2026-09-01",
-  compatibility_flags: ["enable_request_signal"],
   bindings: [
     { type: "durable_object_namespace", name: "HUB", class_name: "GatewayHub" },
-    // Default installer address for the install page; a deployer replaces the text to point elsewhere.
-    { type: "plain_text", name: "INSTALL_SCRIPT_URL", text: DEFAULT_INSTALL_SCRIPT_URL },
   ],
   migrations: { new_tag: "v1", new_sqlite_classes: ["GatewayHub"] },
   // A redeploy keeps variables set in the dashboard (RESET_EPOCH) and the claim secret.
@@ -56,11 +52,9 @@ export async function buildBundle(outDir = join(root, "dist")): Promise<{ file: 
     main: WORKER_METADATA.main_module,
     no_bundle: true,
     compatibility_date: WORKER_METADATA.compatibility_date,
-    compatibility_flags: [...WORKER_METADATA.compatibility_flags],
     workers_dev: true,
     durable_objects: { bindings: [{ name: "HUB", class_name: "GatewayHub" }] },
     migrations: [{ tag: WORKER_METADATA.migrations.new_tag, new_sqlite_classes: [...WORKER_METADATA.migrations.new_sqlite_classes] }],
-    vars: { INSTALL_SCRIPT_URL: DEFAULT_INSTALL_SCRIPT_URL },
     keep_vars: true,
     observability: { enabled: true },
   };

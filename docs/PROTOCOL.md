@@ -4,6 +4,14 @@ This is the byte-level contract between the gateway, the ash Android app (owner)
 and clients. The reference implementation is [`client/client.ts`](../client/client.ts);
 [`src/protocol.ts`](../src/protocol.ts) is normative where this text is ambiguous.
 
+The gateway is a channel only. It claims, authenticates, registers pairings, routes,
+reports presence and relays; what it relays between the phone and a device is
+end-to-end encrypted by the two ends, so it can neither read nor change it. It serves
+no page and no content: every path outside `/v1/` is `404 not_found`. The command that
+installs and pairs a computer is given by Ash in the conversation and downloads the
+program from its GitHub release; the gateway has no part in it beyond `pair.ticket` and
+`/v1/pair/*`.
+
 ## Keys and ids
 
 - Every device has one **ECDSA P-256** key pair. The Android app keeps its private
@@ -77,9 +85,7 @@ POST /v1/auth/challenge {device_id}                   → {nonce, expires_at}
 POST /v1/auth/session   {device_id, nonce, sig}       → {token, expires_at, device_id, role}
 ```
 
-- The token is valid for 15 minutes and is only used to open WebSockets.
-- Browsers also get the token as a `Secure; HttpOnly; SameSite=Strict` cookie named
-  `ash_session`.
+- The token is valid for 15 minutes and is only used to open WebSockets. No cookie is set.
 - An unknown or revoked device gets `404 unknown_device`.
 
 ### Pairing (new client)
@@ -117,12 +123,11 @@ holding a permission is necessary, not sufficient.
 ## WebSocket `GET /v1/ws`
 
 The upgrade is authenticated before it is accepted. The token can be supplied in
-any of three ways:
+either of two ways:
 
-- `Authorization: Bearer <token>` (native);
+- `Authorization: Bearer <token>`;
 - the subprotocol list `["ash.v1", "ash.bearer.<token>"]` — the server answers
-  with `ash.v1`;
-- the `ash_session` cookie (browsers).
+  with `ash.v1`.
 
 All frames are UTF-8 JSON text, at most 64 KiB each. The literal text `ping` gets
 the answer `pong` without waking the Durable Object. Protocol-level ping/pong is
@@ -191,43 +196,12 @@ Suggested envelope types:
 - `agent.event` — phone → client; streamed output and status.
 - `task.status`, `task.cancel`.
 
-## Web tunnel (`web_ui`)
+## Device tunnels (`t: "tun"`)
 
-Every path **outside `/v1/`** is the phone's ash UI (and the `/api/*` it uses).
-
-- A browser whose `ash_session` cookie belongs to a device holding `web_ui` is
-  tunneled to the phone.
-- Browser sessions for such devices last 12 h; all other sessions last 15 min.
-- An unauthenticated browser gets the pairing/login page (also at `/v1/web`): 401 when
-  it has no session, 403 when the device lacks `web_ui`, and 503 while the phone is
-  offline.
-
-The gateway opens one stream id (`sid`) per HTTP request or WebSocket and exchanges
-`t: "tun"` frames with the owner's socket:
-
-| direction | op | fields |
-|---|---|---|
-| gateway → phone | `http.req` | sid, method, path (with query), headers `[[k,v]…]`, from |
-| gateway → phone | `http.reqbody` / `http.reqend` | sid, data (base64url) |
-| phone → gateway | `http.head` | sid, status, headers |
-| phone → gateway | `http.body` / `http.end` / `http.error` | sid, data / — / message |
-| gateway → phone | `ws.open` | sid, path, from |
-| phone → gateway | `ws.opened` / `ws.error` | sid |
-| both | `ws.msg` | sid, `text` or `b64`, `more: true` if the next frame continues it |
-| both | `ws.close` | sid, code, reason |
-| gateway → phone | `http.abort` | sid — the browser went away mid-response (e.g. a closed event stream); stop producing |
-
-Rules:
-- **Chunk size**: data chunks are at most 256 KiB raw. The phone's frames may be up
-  to 1 MiB; everyone else is held to the 64 KiB relay limit.
-- **Headers the gateway never forwards to the phone**: the gateway's own cookie and
-  credentials, hop-by-hop headers, `cf-*` and `x-forwarded-*`.
-- **Headers the phone never returns**: `set-cookie`, content-length and encoding.
-- **Identity**: `from` is the paired device the gateway authenticated. The phone serves
-  the request as that device (ash core: member `device:<id>`), never as itself.
-- **Streams**: responses may stream indefinitely (Server-Sent Events). When writing to the
-  browser fails, the gateway sends `http.abort` so the phone stops; phones may also end
-  long streams themselves (browsers reconnect with `Last-Event-ID`).
+The only tunnel is the owner's `/link` stream to a device holding `expose_capability`
+(below). Every `tun` frame the owner sends names its device in `to`; one that does not is
+answered with `error` `bad_frame`. The owner's own frames may be up to 1 MiB; everyone
+else is held to the 64 KiB relay limit.
 
 ### Device presence
 
@@ -253,31 +227,22 @@ from these transport sids; this layer never retries an action.
 
 `/link` is the only path accepted: any other path is closed with 4404 `path_not_allowed`
 (including the former `/ash/device/stream`). Device HTTP tunnels (`http.*` with `to`) no
-longer exist and are refused with `http.error` `http_tunnel_removed`. Existing browser-to-phone
-tunnels are unchanged: the browser's WebSocket path is forwarded as is and the owner decides.
-The stream carries the `ash-link/1` handshake: the owner sends
-`challenge` first and the device answers `hello`. The gateway stamps `from` on every frame (the
-owner's id towards the device, the device's id towards the owner); that id is the identity
-the owner trusts, and the device's own `from` is overwritten.
+longer exist and are refused with `http.error` `http_tunnel_removed`.
+The stream carries ash's link (`ash-link/2`): after a version announcement in the clear, the
+two ends run TLS 1.3 with each other inside it, each checking the other's key, so the gateway
+only sees ciphertext. The gateway stamps `from` on every frame (the owner's id towards the
+device, the device's id towards the owner); that is routing only — the ends authenticate each
+other inside the stream.
 
 Client API: `connection.openStream(deviceId)` and `connection.onStream(handler)`;
 streams expose `send`, `onMessage`, `onClose`, and `close`. Outer connection closure
 closes all its streams. Callers open a fresh stream after reconnecting.
-
-## Install page `GET /p/<pairing code>`
-
-Public, stateless, `no-store`; it never reaches the hub and does not check the code. It shows the
-one-line install command for the visitor's system (from the User-Agent; the other systems are listed
-below it), with a copy button:
-`curl -fsSL '<installer>' | sh -s -- '<gateway origin>' '<code>'` (`<installer>` is the gateway variable `INSTALL_SCRIPT_URL`: a plain https URL, else the built-in release address) for macOS and Linux. Windows is not
-supported by the computer program yet and says so. A code that is not 8-128 base64url characters
-gets a 404 page and is never placed in a command.
 
 ## Single-file bundle
 
 `npm run build:bundle` writes `dist/ash-gateway.mjs` (one minified ES module: default `fetch`
 handler plus the `GatewayHub` Durable Object class; `cloudflare:workers` stays an import),
 `dist/ash-gateway.metadata.json` (the `metadata` part of the Cloudflare module-upload request:
-`main_module`, compatibility date and flags, the `HUB` Durable Object binding, migration `v1` with
-the SQLite class, a `plain_text` binding `INSTALL_SCRIPT_URL` with the default address, `keep_bindings`) and `dist/ash-gateway.mjs.sha256`. The deployer adds the
+`main_module`, compatibility date, the `HUB` Durable Object binding, migration `v1` with
+the SQLite class, `keep_bindings`) and `dist/ash-gateway.mjs.sha256`. The deployer adds the
 account-specific bindings itself, e.g. `BOOTSTRAP_SECRET` as `secret_text`. `dist/` is not committed.
