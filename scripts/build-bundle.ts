@@ -1,13 +1,14 @@
 // Builds the relay as one ES module file plus the upload metadata, for the hub's one-tap relay
 // setup (Cloudflare "upload worker module" API). Nothing here talks to Cloudflare.
 //
-//   npm run build:bundle  ->  dist/ash-gateway.mjs, dist/ash-gateway.metadata.json
+//   npm run build:bundle  ->  dist/ash-gateway.mjs, dist/ash-gateway.metadata.json, dist/wrangler.jsonc, dist/upgrade.sh,
+//                             dist/SHA256SUMS (all of them; self-hosted relays check against it when they upgrade)
 //
 // The metadata is the multipart `metadata` part of the upload. The deployer adds the account-specific
 // bindings (for example the BOOTSTRAP_SECRET `secret_text`) before sending.
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -59,9 +60,14 @@ export async function buildBundle(outDir = join(root, "dist")): Promise<{ file: 
     observability: { enabled: true },
   };
   writeFileSync(join(outDir, "wrangler.jsonc"), JSON.stringify(deploy, null, 2) + "\n");
+  // A self-hosted relay upgrades itself with this script (scripts/self-host/upgrade.sh): it ships with each release.
+  copyFileSync(join(root, "scripts/self-host/upgrade.sh"), join(outDir, "upgrade.sh"));
   const data = readFileSync(file);
   const sha256 = createHash("sha256").update(data).digest("hex");
   writeFileSync(join(outDir, "ash-gateway.mjs.sha256"), `${sha256}  ash-gateway.mjs\n`);
+  const sums = ["ash-gateway.mjs", "ash-gateway.metadata.json", "wrangler.jsonc", "upgrade.sh"]
+    .map((name) => `${createHash("sha256").update(readFileSync(join(outDir, name))).digest("hex")}  ${name}`);
+  writeFileSync(join(outDir, "SHA256SUMS"), sums.join("\n") + "\n");
   return { file, metadata, sha256, bytes: data.length };
 }
 

@@ -1,0 +1,19 @@
+# The relay on a server of your own: workerd through `wrangler dev`, behind nginx (TLS on 443).
+# Install: cp ash-relay.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ash-relay
+# /etc/default/ash-relay sets ASH_RELAY_PUBLIC: the address clients use (an IP or a host name), without https://.
+[Unit]
+Description=ash relay (ash-gw/1 on workerd)
+After=network-online.target
+[Service]
+EnvironmentFile=/etc/default/ash-relay
+WorkingDirectory=/opt/ash-relay/current
+Environment=WRANGLER_SEND_METRICS=false
+Environment=CI=1
+# --local-upstream/--upstream-protocol: requests are seen as https://<public address>, which the claim and every signature are bound to.
+# --persist-to: the relay's state (owner, devices, grants) lives outside the release folders, so upgrades keep it.
+ExecStart=/opt/ash-relay/node_modules/.bin/wrangler dev -c wrangler.local.jsonc --ip 127.0.0.1 --port 8787 --local-upstream ${ASH_RELAY_PUBLIC} --upstream-protocol https --persist-to /var/lib/ash-relay --show-interactive-dev-session=false --log-level warn
+Restart=always
+RestartSec=3
+MemoryMax=600M
+[Install]
+WantedBy=multi-user.target

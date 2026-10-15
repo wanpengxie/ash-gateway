@@ -38,6 +38,10 @@
 
 **手机丢了怎么办**：在 Cloudflare 控制台 → 这个 Worker → Settings → Variables，添加或修改变量 `RESET_EPOCH`，填一个新值（比如 `1`，下次再重置就填 `2`），保存并部署。网关会清空全部设备和授权，等待重新认领。能做这件事的只有 Cloudflare 账户的持有者，任何公网请求都触发不了重置。仓库配置开启了 `keep_vars`，之后的部署不会把这个值改回去。
 
+### 跑在自己的服务器上
+
+不用 Cloudflare 也行：一台有公网 IP 的 Linux 服务器（nginx + `wrangler dev`），只有 IP 没有域名也能拿证书。安装、证书、升级和回滚见 [scripts/self-host/README.md](scripts/self-host/README.md)；升级只从本仓库的 GitHub 发布页取文件，按发布的 `SHA256SUMS` 校验。
+
 ### 自定义域名
 
 当前部署绑定了 `https://ash.onestudio.cc`，同时保留原来的 `workers.dev` 地址；两个入口连接的是同一个 Worker 和 GatewayHub，不会重新认领或清空设备。

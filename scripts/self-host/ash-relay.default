@@ -1,0 +1,3 @@
+# /etc/default/ash-relay: read by ash-relay.service.
+# The address the phone and the computers reach this relay at (what https://<this> is). An IP is enough.
+ASH_RELAY_PUBLIC=203.0.113.7

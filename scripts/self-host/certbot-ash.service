@@ -1,0 +1,6 @@
+# Renews the relay's certificate (an IP certificate lasts about 6 days: it must renew on its own).
+[Unit]
+Description=Renew the ash relay certificate
+[Service]
+Type=oneshot
+ExecStart=/opt/certbot/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"
