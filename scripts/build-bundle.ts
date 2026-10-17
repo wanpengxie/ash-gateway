@@ -27,6 +27,8 @@ export const WORKER_METADATA = {
   observability: { enabled: true },
 } as const;
 
+export const SELF_HOST_FILES = ["upgrade.sh", "workerd.capnp", "ash-relay.service", "healthcheck.sh", "ash-relay-health.service", "ash-relay-health.timer"] as const;
+
 export async function buildBundle(outDir = join(root, "dist")): Promise<{ file: string; metadata: string; sha256: string; bytes: number }> {
   mkdirSync(outDir, { recursive: true });
   const file = join(outDir, "ash-gateway.mjs");
@@ -61,11 +63,11 @@ export async function buildBundle(outDir = join(root, "dist")): Promise<{ file: 
   };
   writeFileSync(join(outDir, "wrangler.jsonc"), JSON.stringify(deploy, null, 2) + "\n");
   // A self-hosted relay upgrades itself with this script (scripts/self-host/upgrade.sh): it ships with each release.
-  copyFileSync(join(root, "scripts/self-host/upgrade.sh"), join(outDir, "upgrade.sh"));
+  for (const name of SELF_HOST_FILES) copyFileSync(join(root, "scripts/self-host", name), join(outDir, name));
   const data = readFileSync(file);
   const sha256 = createHash("sha256").update(data).digest("hex");
   writeFileSync(join(outDir, "ash-gateway.mjs.sha256"), `${sha256}  ash-gateway.mjs\n`);
-  const sums = ["ash-gateway.mjs", "ash-gateway.metadata.json", "wrangler.jsonc", "upgrade.sh"]
+  const sums = ["ash-gateway.mjs", "ash-gateway.metadata.json", "wrangler.jsonc", ...SELF_HOST_FILES]
     .map((name) => `${createHash("sha256").update(readFileSync(join(outDir, name))).digest("hex")}  ${name}`);
   writeFileSync(join(outDir, "SHA256SUMS"), sums.join("\n") + "\n");
   return { file, metadata, sha256, bytes: data.length };

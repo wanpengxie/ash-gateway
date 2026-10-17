@@ -37,7 +37,7 @@ import { DeviceTunnels } from "./device-tunnels";
 import { ensureSchema } from "./schema";
 import { pairPendingEntry, pairRequestFrame } from "./pairing";
 
-export const GATEWAY_VERSION = "0.7.1";
+export const GATEWAY_VERSION = "0.7.2";
 
 interface Attachment {
   retired?: boolean;

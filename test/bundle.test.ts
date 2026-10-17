@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildBundle, WORKER_METADATA } from "../scripts/build-bundle";
+import { buildBundle, WORKER_METADATA, SELF_HOST_FILES } from "../scripts/build-bundle";
 
 test("the relay bundle is one module with the worker and Durable Object exports, matching wrangler.jsonc", async () => {
   const out = mkdtempSync(join(tmpdir(), "ash-bundle-"));
@@ -29,7 +29,7 @@ test("a release lists every file it publishes in SHA256SUMS, upgrade.sh among th
   const out = mkdtempSync(join(tmpdir(), "ash-bundle-"));
   await buildBundle(out);
   const lines = readFileSync(join(out, "SHA256SUMS"), "utf8").trim().split("\n").map((l) => l.split("  "));
-  assert.deepEqual(lines.map(([, name]) => name), ["ash-gateway.mjs", "ash-gateway.metadata.json", "wrangler.jsonc", "upgrade.sh"]);
+  assert.deepEqual(lines.map(([, name]) => name), ["ash-gateway.mjs", "ash-gateway.metadata.json", "wrangler.jsonc", ...SELF_HOST_FILES]);
   for (const [sha, name] of lines) assert.equal(sha, createHash("sha256").update(readFileSync(join(out, name!))).digest("hex"), name);
   assert.equal(readFileSync(join(out, "upgrade.sh"), "utf8"), readFileSync(join(import.meta.dirname, "../scripts/self-host/upgrade.sh"), "utf8"));
 });

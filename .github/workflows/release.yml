@@ -19,6 +19,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/ash-gateway.mjs dist/ash-gateway.metadata.json dist/ash-gateway.mjs.sha256 dist/wrangler.jsonc dist/upgrade.sh dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/ash-gateway.mjs dist/ash-gateway.metadata.json dist/ash-gateway.mjs.sha256 dist/wrangler.jsonc dist/upgrade.sh dist/workerd.capnp dist/ash-relay.service dist/healthcheck.sh dist/ash-relay-health.service dist/ash-relay-health.timer dist/SHA256SUMS \
             --title "$GITHUB_REF_NAME" \
             --notes "Deploy without the source: download these files into one folder, set \"name\" (and \"routes\" for your own domain) in wrangler.jsonc, then run npx wrangler deploy. Then set the claim secret: npx wrangler secret put BOOTSTRAP_SECRET. A relay on your own server upgrades with upgrade.sh <version> (scripts/self-host/README.md); every file is in SHA256SUMS."

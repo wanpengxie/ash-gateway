@@ -1,0 +1,7 @@
+[Unit]
+Description=Check ash relay responsiveness
+After=ash-relay.service
+[Service]
+Type=oneshot
+ExecStart=/opt/ash-relay/current/healthcheck.sh
+TimeoutStartSec=30
